@@ -774,23 +774,13 @@ def is_in_approaching_direction(src, target, ang_vel, tx=None, ty=None):
 
 
 
-def aim_at_target(src, target, ships, initial_by_id, ang_vel, world=None):
-    """Returns (angle, turns) for sending `ships` from src to hit target.
-    Iterates orbital prediction. Returns None if the path is blocked by the
-    sun OR if convergence isn't reached â€” better to skip a target than fire
-    a fleet that wanders past it because our aim didn't settle.
-
-    V13.3 Q1: when target is a comet AND world is passed, use comet path for
-    future-position; otherwise existing orbital extrapolation.
-
-    V13.3 R4 (behind-sun wait): if the FIRST estimate fails (current path
-    blocked by sun), try aiming at projected future positions of the target
-    where the orbital motion may have cleared the path. We launch NOW aiming
-    at where the target WILL be â€” fleet flies straight, target swings into
-    place. Better than rejecting the shot entirely."""
+def aim_at_target(src, target, ships, initial_by_id, ang_vel, world=None,
+                  check_approach=False):
+    """Returns (angle, turns) or None.
+    check_approach=True applies SEGMENT_MAX_TURNS limit and direction check.
+    """
     est = estimate_arrival(src.x, src.y, src.radius, target.x, target.y, target.radius, ships)
     if est is None and R4_BEHIND_SUN_WAIT_ENABLED and world is not None:
-        
         for future_t in range(2, R4_FUTURE_HORIZON, 2):
             if target.id in world.comet_ids:
                 pos = predict_comet_position(target.id, world.comets, future_t)
@@ -799,7 +789,7 @@ def aim_at_target(src, target, ships, initial_by_id, ang_vel, world=None):
                 if init is None:
                     pos = None
                 elif dist(init.x, init.y, CENTER_X, CENTER_Y) + init.radius >= ROTATION_LIMIT:
-                    pos = None  
+                    pos = None
                 else:
                     pos = predict_planet_position(target, initial_by_id, ang_vel, future_t)
             if pos is None:
@@ -809,38 +799,55 @@ def aim_at_target(src, target, ships, initial_by_id, ang_vel, world=None):
                 break
     if est is None:
         return None
-    
+
     is_comet = world is not None and target.id in world.comet_ids
     if not is_comet:
         init = initial_by_id.get(target.id)
         if init is None:
-            return est
-        if dist(init.x, init.y, CENTER_X, CENTER_Y) + init.radius >= ROTATION_LIMIT:
-            return est
-
-    angle, turns = est
-    tx, ty = target.x, target.y
-    for _ in range(AIM_MAX_ITERS):
-        if is_comet:
-            pos = predict_comet_position(target.id, world.comets, turns)
-            if pos is None:
-                
-                return None
-            ntx, nty = pos
+            result = est
+        elif dist(init.x, init.y, CENTER_X, CENTER_Y) + init.radius >= ROTATION_LIMIT:
+            result = est
         else:
-            ntx, nty = predict_planet_position(target, initial_by_id, ang_vel, turns)
-        nest = estimate_arrival(src.x, src.y, src.radius, ntx, nty, target.radius, ships)
-        if nest is None:
+            result = None
+    else:
+        result = None
+
+    if result is None:
+        angle, turns = est
+        tx, ty = target.x, target.y
+        for _ in range(AIM_MAX_ITERS):
+            if is_comet:
+                pos = predict_comet_position(target.id, world.comets, turns)
+                if pos is None:
+                    return None
+                ntx, nty = pos
+            else:
+                ntx, nty = predict_planet_position(target, initial_by_id, ang_vel, turns)
+            nest = estimate_arrival(src.x, src.y, src.radius, ntx, nty, target.radius, ships)
+            if nest is None:
+                return None
+            nangle, nturns = nest
+            if (abs(ntx - tx) < AIM_CONVERGE_DIST
+                    and abs(nty - ty) < AIM_CONVERGE_DIST
+                    and abs(nturns - turns) <= AIM_CONVERGE_TURNS):
+                result = (nangle, nturns)
+                break
+            angle, turns = nangle, nturns
+            tx, ty = ntx, nty
+        if result is None:
             return None
-        nangle, nturns = nest
-        if (abs(ntx - tx) < AIM_CONVERGE_DIST
-                and abs(nty - ty) < AIM_CONVERGE_DIST
-                and abs(nturns - turns) <= AIM_CONVERGE_TURNS):
-            return nangle, nturns
-        angle, turns = nangle, nturns
-        tx, ty = ntx, nty
-    
-    return None
+
+    if check_approach:
+        final_angle, final_turns = result
+        if final_turns > SEGMENT_MAX_TURNS:
+            return None
+        if world is not None:
+            pred_x, pred_y = predict_target_position(target, world, int(final_turns))
+            if not is_in_approaching_direction(src, target, ang_vel,
+                                               tx=pred_x, ty=pred_y):
+                return None
+
+    return result
 
 
 
@@ -849,7 +856,7 @@ def fleet_target_planet(fleet, planets, initial_by_id=None, ang_vel=0.0):
 
     Two-pass: static planets via cheap straight-line intersection, orbital
     planets via per-turn forward simulation. The naive straight-line check
-    against the planet's CURRENT position misses orbital targets â€” the
+    against the planet's CURRENT position misses orbital targets â€" the
     planet has rotated since the fleet launched, so the ray won't intersect
     its current XY but WILL intersect its future orbital position. Without
     accounting for this, incoming hostile fleets at our orbital planets
@@ -1111,14 +1118,14 @@ def forward_project(world, our_capture_target=None, our_capture_turn=None,
     """Project every planet's owner+ship count forward `horizon` turns.
 
     Inputs:
-      world â€” current World snapshot.
-      our_capture_target/turn/ships â€” optional our planned capture (treated
+      world â€" current World snapshot.
+      our_capture_target/turn/ships â€" optional our planned capture (treated
         as a hypothetical friendly fleet arrival).
-      horizon â€” how many turns to project.
-      project_opponent_moves â€” if True, each enemy planet launches a fraction
+      horizon â€" how many turns to project.
+      project_opponent_moves â€" if True, each enemy planet launches a fraction
         of its CURRENT surplus toward its closest non-friendly target every
         few turns. Increases accuracy at cost of pessimism for our holdings.
-      opponent_emit_fraction â€” fraction of surplus the projected launch sends.
+      opponent_emit_fraction â€" fraction of surplus the projected launch sends.
     Returns:
       dict planet_id -> (owner_at_H, ships_at_H).
 
@@ -1340,7 +1347,7 @@ def search_step_action(world, max_per_source=3, max_actions_to_eval=10,
 
 
 def generate_step_actions(world, max_per_source=3):
-    """Generate candidate "step actions" â€” Melis style. Each step action is
+    """Generate candidate "step actions" â€" Melis style. Each step action is
     a single capture targeting one planet, sourced from one of our planets.
 
     Returns list of dicts: {"target_id", "source_id", "angle", "arrival_turn",
@@ -1412,14 +1419,14 @@ def melis_evaluate(world, our_step_action=None, horizon=12, future_horizon=8,
     """Melis full-attack-future evaluator.
 
     Inputs:
-      world â€” current World snapshot.
-      our_step_action â€” optional dict {"target_id", "arrival_turn", "ships"}.
+      world â€" current World snapshot.
+      our_step_action â€" optional dict {"target_id", "arrival_turn", "ships"}.
         If provided, simulates our planned capture as part of the projection.
-      horizon â€” short-term sim horizon for our action's effect.
-      future_horizon â€” additional "all-attack-future" projection turns where
+      horizon â€" short-term sim horizon for our action's effect.
+      future_horizon â€" additional "all-attack-future" projection turns where
         every planet (us + opponents) keeps emitting surplus toward closest
         non-friendly. Captures position quality beyond the immediate move.
-      opp_emit â€” fraction of surplus opponents launch in projection. 0.30
+      opp_emit â€" fraction of surplus opponents launch in projection. 0.30
         is the calibrated default; lower = more capture-friendly.
 
     Returns: scalar score from our player's POV (higher = better).
@@ -1924,8 +1931,8 @@ def _detect_mode(world):
     opening since initial expansions look like aggression but aren't.
 
     V12.2 R2: in 2P, sustained PATIENT with no production-share gain forces
-    escalation (10 turns â†’ OPPORTUNISTIC, 20 turns â†’ PRESSURE). This is the
-    Bocsimacko "value action over inaction" principle â€” patient-vs-patient
+    escalation (10 turns â†' OPPORTUNISTIC, 20 turns â†' PRESSURE). This is the
+    Bocsimacko "value action over inaction" principle â€" patient-vs-patient
     1v1 is a stable equilibrium the bot otherwise can't leave.
     """
     if world.is_opening:
@@ -1993,9 +2000,6 @@ def _record_2p_progress(my_prod_share, intended_patient, reset=False):
 
 
 _agent_step = 0
-_hammer_plan = None
-_planet_idle_counts = {}
-_promoted_stockpiles = set()
 _game_num_players = None
 _2p_patient_streak = 0
 _2p_prod_share_history = []
@@ -2310,7 +2314,7 @@ def _fwd_my_score(state, player):
 
 
 def _fwd_marginal(world, src_id, angle, ships, player, horizon):
-    """V12.8ay: Î” score (with-launch âˆ’ without-launch) at horizon."""
+    """V12.8ay: Î" score (with-launch âˆ' without-launch) at horizon."""
     state_no = _fwd_clone(world)
     _fwd_simulate(state_no, horizon)
     base = _fwd_my_score(state_no, player)
@@ -2346,7 +2350,7 @@ def is_targetable(world, target):
     is already being captured.
 
     V12.9 cap55: enforce the neutral hard cap (2P >=55, 4P legacy) here so
-    every targeting code path obeys it â€” the previous per-call check at
+    every targeting code path obeys it â€" the previous per-call check at
     generate_step_actions/handle_expand missed cheap-pickup, multiprong, and
     other paths."""
     if target.id in world.comet_ids:
@@ -2382,7 +2386,7 @@ def is_targetable(world, target):
 def _update_neutral_watchlist(world):
     """V12.8c: rebuild the wounded-neutral set from this turn's deltas.
     A neutral that lost >= NEUTRAL_WATCHLIST_MIN_DROP ships since last
-    turn is considered wounded â€” someone else attacked it, so it's now
+    turn is considered wounded â€" someone else attacked it, so it's now
     cheaper for us to take. _neutral_prev_ships is then refreshed.
 
     V13.3 F1: also track enemy planet ship-drops as 'recently launched'
@@ -2451,7 +2455,7 @@ def _update_neutral_watchlist(world):
 def _neutral_blocked_by_cap(world, target):
     """V12.9 cap55: ignore neutrals with high garrison. V13.3 N4: use
     effective_garrison_at_arrival projection (estimated 10-turn lookahead)
-    so a 60-ship neutral about to be hit by enemy 8 â†’ effective 52 â†’ unblocks."""
+    so a 60-ship neutral about to be hit by enemy 8 â†' effective 52 â†' unblocks."""
     if not NEUTRAL_HARD_CAP_ENABLED:
         return False
     if target.owner != -1:
@@ -2536,7 +2540,7 @@ def _endgame_roi_ok(world, target, ships, turns):
 
 
 def friendly_already_committed(world, target_id):
-    """Patient ethos: ONE main fleet per target â€” UNLESS the target is enemy
+    """Patient ethos: ONE main fleet per target â€" UNLESS the target is enemy
     and our in-flight fleet undershoots its growing garrison.
 
     Neutrals don't grow, so a correctly-sized fleet wins or loses on arrival;
@@ -2616,17 +2620,12 @@ def plan_solo_capture(world, src, tgt, max_avail, max_travel):
         min_floor = 5 if (world.is_2p and raw_dist < 12.0) else MIN_DISPATCH_SHIPS
     if max_avail < min_floor:
         return None
-    aim = aim_at_target(src, tgt, max_avail, world.initial_by_id, world.ang_vel, world=world)
+    aim = aim_at_target(src, tgt, max_avail, world.initial_by_id, world.ang_vel,
+                        world=world, check_approach=True)
     if aim is None:
         return None
     angle, turns = aim
-    if turns > SEGMENT_MAX_TURNS:
-        return None
     if turns > max_travel:
-        return None
-    # Ideas 1+7: check direction using predicted target position at arrival time
-    pred_x, pred_y = predict_target_position(tgt, world, int(turns))
-    if not is_in_approaching_direction(src, tgt, world.ang_vel, tx=pred_x, ty=pred_y):
         return None
     need = effective_needed_to_capture(tgt, turns, world)  
     margin = EXPAND_MIN_MARGIN_4P if not world.is_2p else EXPAND_MIN_MARGIN
@@ -2651,12 +2650,11 @@ def plan_solo_capture(world, src, tgt, max_avail, max_travel):
             ships = max(min_floor, need)  
     if ships < min_floor or ships > max_avail:
         return None
-    aim2 = aim_at_target(src, tgt, ships, world.initial_by_id, world.ang_vel, world=world)
+    aim2 = aim_at_target(src, tgt, ships, world.initial_by_id, world.ang_vel,
+                         world=world, check_approach=True)
     if aim2 is None:
         return None
     angle, turns = aim2
-    if turns > SEGMENT_MAX_TURNS:
-        return None
     if turns > max_travel:
         return None
     need2 = effective_needed_to_capture(tgt, turns, world)
@@ -2664,12 +2662,11 @@ def plan_solo_capture(world, src, tgt, max_avail, max_travel):
         ships = need2 + margin
         if ships > max_avail:
             return None
-        aim3 = aim_at_target(src, tgt, ships, world.initial_by_id, world.ang_vel, world=world)
+        aim3 = aim_at_target(src, tgt, ships, world.initial_by_id, world.ang_vel,
+                             world=world, check_approach=True)
         if aim3 is None:
             return None
         angle, turns = aim3
-        if turns > SEGMENT_MAX_TURNS:
-            return None
         if turns > max_travel:
             return None
     
@@ -2714,7 +2711,7 @@ def handle_defense(world, rescue_needs, available, spent, target_locked,
     V14.2 (Phase 3.8): preemptive doom-evac. When total incoming enemy
     ships overwhelm garrison+future_production, the planet is definitely
     doomed even with rescue. Skip rescue (which wastes ships) and evac
-    directly. User-observed scenario: 40 garrison, 10+49 incoming â†’ solo
+    directly. User-observed scenario: 40 garrison, 10+49 incoming â†' solo
     rescue would send a sub-need fleet and still lose; better to evac.
     """
     if not rescue_needs:
@@ -2839,13 +2836,13 @@ def _try_doom_evac(world, victim, available, spent, target_locked, moves, mode_l
 
     When rescue attempts have failed and the planet is about to flip, send
     its garrison to our highest-production friendly within reach. Preserves
-    ships that would otherwise be captured. User-observed scenario: 40 garrison, 10+49 incoming â†’ solo
+    ships that would otherwise be captured. User-observed scenario: 40 garrison, 10+49 incoming â†' solo
     rescue would send a sub-need fleet and still lose; better to evac.
 
     V14.2 (Phase 3.6, Idea 5): attack-fallback. If no friendly destination,
     try sending the garrison to a winnable enemy/neutral target instead of
     letting the ships die with the planet. Prioritizes enemy planets in
-    _enemy_recently_launched (they just emptied â†’ weakly defended).
+    _enemy_recently_launched (they just emptied â†' weakly defended).
     """
     if not DOOM_EVAC_ENABLED:
         return False
@@ -2998,7 +2995,7 @@ def _find_defense_coalition(world, victim, deadline, need, available, spent):
 def handle_comet_evac(world, available, spent, target_locked, moves, mode_log):
     """For each owned comet about to expire, send ALL its ships to the nearest
     non-comet friendly planet (or neutral fallback). Ships left on a comet
-    that exits the system are lost permanently â€” evacuation preserves them.
+    that exits the system are lost permanently â€" evacuation preserves them.
     """
     if not world.comet_remaining:
         return
@@ -3050,100 +3047,6 @@ def handle_comet_evac(world, available, spent, target_locked, moves, mode_log):
                       src.id, best.id, angle, turns, int(avail))
         mode_log[src.id] = "comet-evac"
 
-
-
-def handle_cheap_pickup(world, available, spent, target_locked, moves, mode_log):
-    """V12.4d (4P-only): each idle source fires on the cheapest reachable
-    low-garrison neutral if it can solo it. Bypasses the K=1 mid-game
-    starvation where small free planets sit ignored because the source's
-    K=1 nearest is a higher-garrison target. 4P-only â€” see CHEAP_PICKUP_4P_ONLY.
-    """
-    if not CHEAP_PICKUP_ENABLED:
-        return
-    if CHEAP_PICKUP_4P_ONLY and world.is_2p:
-        return
-    
-    
-    if LAUNCH_BLACKOUT_ENABLED and world.step >= TOTAL_STEPS - LAUNCH_BLACKOUT_TURNS:
-        return
-    if world.is_opening:
-        max_travel = world.mode_params.get("expand_max_travel_opening", EXPAND_MAX_TRAVEL_OPENING)
-    else:
-        max_travel = world.mode_params["expand_max_travel_mid"]
-
-    cheap_neutrals = [
-        p for p in world.neutral_planets
-        if int(p.ships) <= CHEAP_PICKUP_MAX_GARRISON
-        and p.id not in target_locked
-        and is_targetable(world, p)
-    ]
-    if not cheap_neutrals:
-        return
-    
-    if CHEAP_PICKUP_MIN_PROD >= 2 and any(int(p.production) >= CHEAP_PICKUP_MIN_PROD for p in cheap_neutrals):
-        cheap_neutrals = [p for p in cheap_neutrals if int(p.production) >= CHEAP_PICKUP_MIN_PROD]
-
-    sources = sorted(world.my_planets,
-                     key=lambda s: -(available[s.id] - spent[s.id]))
-    for src in sources:
-        avail = available[src.id] - spent[src.id]
-        if avail < MIN_DISPATCH_SHIPS:
-            continue
-        if mode_log.get(src.id):
-            continue
-        candidates = []
-        for n in cheap_neutrals:
-            if n.id in target_locked:
-                continue
-            if friendly_already_committed(world, n.id):
-                continue
-            cost = int(n.ships) + 1
-            if cost > avail:
-                continue
-            raw = dist(src.x, src.y, n.x, n.y)
-            if raw / MAX_SPEED > max_travel + 4:
-                continue
-            eff = _effective_target_dist(src, n, world)
-            candidates.append((cost, eff, n))
-        if not candidates:
-            continue
-        candidates.sort(key=lambda kv: (kv[0], kv[1]))
-        for _cost, _eff, n in candidates:
-            plan = plan_solo_capture(world, src, n, avail, max_travel)
-            if plan is None:
-                continue
-            angle, turns, ships = plan
-            if RACE_ENABLED:
-                enemy_eta = world.enemy_race_eta.get(n.id)
-                if enemy_eta is not None and turns > enemy_eta:
-                    continue
-            if not _capture_holds_against_snipe(world, n, turns, int(ships)):
-                continue
-            if not _endgame_roi_ok(world, n, int(ships), turns):
-                continue
-            if not _neutral_tempo_ok(world, n, int(ships), turns):
-                continue
-            _commit_fleet(world, moves, spent, target_locked,
-                          src.id, n.id, angle, turns, int(ships))
-            mode_log[src.id] = "cheap-pickup"
-            break
-
-
-def _is_cheap_neutral_pick(world, target):
-    """V14.1f (Phase 3.5, Idea 4): cheap-pick predicate for combat-contact gate.
-
-    Returns True if the neutral target has small garrison AND there exists
-    one of our planets within COMBAT_CHEAP_DIST. Used to preserve free
-    pickups while dropping expensive neutrals during active combat.
-    """
-    if target.owner != -1:
-        return True  
-    if int(target.ships) > COMBAT_CHEAP_GARRISON:
-        return False
-    for mp in world.my_planets:
-        if dist(mp.x, mp.y, target.x, target.y) <= COMBAT_CHEAP_DIST:
-            return True
-    return False
 
 
 def _handle_search_expand_4p(world, available, spent, target_locked, moves, mode_log):
@@ -3319,7 +3222,7 @@ def _effective_target_dist(src, tgt, world):
     Predicts target position at expected travel time and returns distance
     to that future position. Static planets unchanged. Orbital planets
     rotating toward us get a shorter effective distance (promote);
-    rotating away get longer (demote). One-step approximation â€” cheap;
+    rotating away get longer (demote). One-step approximation â€" cheap;
     real arrival is computed later by aim_at_target inside plan_solo_capture.
     Affects WHICH targets get inspected when K is small, not which fleets fly.
     """
@@ -3342,7 +3245,7 @@ def _effective_target_dist(src, tgt, world):
 def _counter_snipe_candidates(world, src, max_travel, target_locked):
     """V12.4c: neutrals where a known enemy fleet will capture before us, and
     we can re-flip cheaply on a short follow-up. Returns [(target, raw_dist)]
-    sorted by re-flip cost ascending. 2P-only â€” see COUNTER_SNIPE_2P_ONLY note.
+    sorted by re-flip cost ascending. 2P-only â€" see COUNTER_SNIPE_2P_ONLY note.
     """
     if not COUNTER_SNIPE_ENABLED:
         return []
@@ -3756,7 +3659,7 @@ def _try_coalition_expand(world, src, tgt, max_travel, available, spent,
                           target_locked, moves, mode_log):
     """src can't take tgt alone; find a partner whose combined ships flip it.
     Each contributor must send >= COALITION_MIN_PER_CONTRIBUTOR (no tiny
-    pieces). For tiny targets we DON'T split â€” the patient ethos prefers
+    pieces). For tiny targets we DON'T split â€" the patient ethos prefers
     waiting for a solo fleet over showering a small target with two halves.
     """
     src_avail = available[src.id] - spent[src.id]
@@ -3857,723 +3760,6 @@ def _try_coalition_expand(world, src, tgt, max_travel, available, spent,
         return True
 
     return False
-
-
-def _routine_avail(world, planet, base_avail):
-    """V14.1d iter g: production-tier reserve. Subtract a fraction of high-prod
-    planet garrison from routine expand/hammer spending. The reserve grows
-    naturally via production and is available to mega-hammer.
-    """
-    if not PROD_RESERVE_ENABLED:
-        return base_avail
-    if PROD_RESERVE_4P_ONLY and world.is_2p:
-        return base_avail
-    if world.step < PROD_RESERVE_TURN_MIN:
-        return base_avail
-    if int(planet.production) < PROD_RESERVE_MIN_PROD:
-        return base_avail
-    reserve = int(int(planet.ships) * PROD_RESERVE_FRAC)
-    return max(0, base_avail - reserve)
-
-
-def _brain_pick_lead(world, available, spent, mode_log, min_ships=None):
-    """Shared lead-picker used by both _brain_reserve_lead (pre-pass) and
-    handle_accumulator (post-defense). Returns Planet or None.
-
-    Identical logic to handle_accumulator's original lead-selection so the
-    reservation and the actual feeder-target agree. min_ships defaults to
-    the accumulator's threshold; the brain pre-pass passes a higher value.
-    """
-    if min_ships is None:
-        min_ships = ACCUMULATOR_LEAD_MIN_SHIPS
-    enemies = world.enemy_planets
-    candidates = []
-    for p in world.my_planets:
-        status = mode_log.get(p.id)
-        
-        if status and status != "brain-reserved-lead":
-            continue
-        avail = available[p.id] - spent[p.id]
-        if avail < min_ships:
-            continue
-        threat = sum(int(ships) for eta, owner, ships
-                     in world.arrivals_by_planet.get(p.id, [])
-                     if owner != world.player and owner != -1)
-        if threat >= avail * ACCUMULATOR_LEAD_THREAT_RATIO:
-            continue
-        if BRAIN_LEAD_PREFER_FRONTIER and enemies:
-            frontier_dist = min(dist(p.x, p.y, e.x, e.y) for e in enemies)
-            score = float(avail) - frontier_dist * BRAIN_LEAD_FRONTIER_WEIGHT
-        else:
-            score = float(avail)
-        candidates.append((score, p))
-    if not candidates:
-        return None
-    candidates.sort(key=lambda x: -x[0])
-    return candidates[0][1]
-
-
-def _brain_reserve_lead(world, available, spent, mode_log):
-    """B1 (one-brain pre-pass): mark the future accumulator-lead with a
-    sentinel so handle_expand can't drain it into small-ship pickups before
-    handle_accumulator / handle_mega_hammer run.
-
-    Runs after defense (which doesn't gate on mode_log status of sources)
-    and before the expand â†’ accumulator â†’ mega-hammer chain. If defense
-    later commits the same planet, defense overwrites mode_log[p.id] = 'defense'
-    and the chain naturally skips it â€” life beats lead."""
-    if not BRAIN_LEAD_RESERVE_ENABLED:
-        return
-    if not ACCUMULATOR_ENABLED:
-        return
-    if BRAIN_LEAD_RESERVE_4P_ONLY and world.is_2p:
-        return
-    if ACCUMULATOR_4P_ONLY and world.is_2p:
-        return
-    if world.step < ACCUMULATOR_TURN_MIN:
-        return
-    lead = _brain_pick_lead(world, available, spent, mode_log,
-                            min_ships=BRAIN_LEAD_RESERVE_MIN_SHIPS)
-    if lead is None:
-        return
-    
-    
-    if BRAIN_LEAD_RESERVE_REQUIRE_TARGET:
-        has_target = False
-        for tgt in world.enemy_planets:
-            if int(tgt.ships) > MEGA_HAMMER_TARGET_GARRISON_MAX_ITER_H:
-                continue
-            aim = aim_at_target(lead, tgt, available[lead.id] - spent[lead.id],
-                                world.initial_by_id, world.ang_vel, world=world)
-            if aim is None:
-                continue
-            _, turns = aim
-            if turns > MEGA_HAMMER_MAX_TRAVEL:
-                continue
-            has_target = True
-            break
-        if not has_target:
-            return
-    mode_log[lead.id] = "brain-reserved-lead"
-
-
-def handle_accumulator(world, available, spent, target_locked, moves, mode_log):
-    """V14.2 (Phase 3.7, Idea 6c): accumulator â€” feed surplus from safe
-    backline planets to the lead stockpile each turn.
-
-    Engine: fleet speed = 1 + 5Ã—(log(ships)/log(1000))^1.5. One big fleet
-    (1000 ships, speed 6) arrives faster AND survives tied-combat better
-    than 4 fleets of 250 ships. Concentration > spread.
-
-    Strategy: each turn, identify our planet with the most ships ("lead").
-    For other planets in the safe backline (no incoming enemy threat AND
-    surplus above reserve), send their surplus TO the lead. Over multiple
-    turns, the lead accumulates a massive stockpile and handle_mega_hammer
-    fires it as one overwhelming strike.
-
-    Runs BEFORE handle_mega_hammer so accumulated ships are visible to
-    mega-hammer this turn (but in-flight feeds arrive on later turns).
-    """
-    if not ACCUMULATOR_ENABLED:
-        return
-    if ACCUMULATOR_4P_ONLY and world.is_2p:
-        return
-    if world.step < ACCUMULATOR_TURN_MIN:
-        return
-
-    
-    
-    lead_candidates = []
-    for p in world.my_planets:
-        status = mode_log.get(p.id)
-        if status and status != "brain-reserved-lead":
-            continue
-        avail = available[p.id] - spent[p.id]
-        if avail < ACCUMULATOR_LEAD_MIN_SHIPS:
-            continue
-        
-        threat = sum(int(ships) for eta, owner, ships
-                     in world.arrivals_by_planet.get(p.id, [])
-                     if owner != world.player and owner != -1)
-        if threat >= avail * ACCUMULATOR_LEAD_THREAT_RATIO:
-            continue
-        lead_candidates.append((avail, p))
-    if not lead_candidates:
-        return
-    lead_candidates.sort(key=lambda x: -x[0])
-    lead_avail, lead = lead_candidates[0]
-
-    
-    feeders = []
-    for p in world.my_planets:
-        if p.id == lead.id or p.id in mode_log:
-            continue
-        
-        threat = sum(int(ships) for eta, owner, ships
-                     in world.arrivals_by_planet.get(p.id, [])
-                     if owner != world.player and owner != -1)
-        if threat > 0:
-            continue
-        avail = available[p.id] - spent[p.id]
-        surplus = avail - ACCUMULATOR_FEEDER_KEEP_RESERVE
-        if surplus < ACCUMULATOR_FEEDER_MIN_SURPLUS:
-            continue
-        
-        aim = aim_at_target(p, lead, surplus, world.initial_by_id,
-                            world.ang_vel, world=world)
-        if aim is None:
-            continue
-        angle, turns = aim
-        if turns > ACCUMULATOR_FEEDER_MAX_TRAVEL:
-            continue
-        feeders.append((turns, surplus, p, angle))
-
-    if not feeders:
-        return
-    
-    feeders.sort(key=lambda x: (x[0], -x[1]))
-    fed_count = 0
-    for turns, surplus, src, angle in feeders:
-        if fed_count >= ACCUMULATOR_MAX_FEEDS_PER_TURN:
-            break
-        _commit_fleet(world, moves, spent, target_locked,
-                      src.id, lead.id, angle, turns, int(surplus))
-        mode_log[src.id] = "accumulator-feeder"
-        fed_count += 1
-    if fed_count > 0:
-        
-        if lead.id not in mode_log:
-            mode_log[lead.id] = "accumulator-lead"
-
-
-def handle_mega_hammer(world, available, spent, target_locked, moves, mode_log):
-    """V14.1c (Phase 3.3): single-source overwhelming strike.
-
-    For each of our planets with avail >= MEGA_HAMMER_SHIPS_MIN, find an
-    enemy target whose garrison (after projected arrivals) is <=
-    MEGA_HAMMER_TARGET_GARRISON_MAX and is within MEGA_HAMMER_MAX_TRAVEL
-    turns. Launch the ENTIRE garrison as a single huge fleet â€” exploits
-    the fleet-speed log formula (bigger = faster) and overwhelms
-    reactive defense.
-
-    Runs BEFORE handle_hammer so a successful mega strike isn't dissolved
-    into the multi-stockpile coalition logic.
-    """
-    if not MEGA_HAMMER_ENABLED:
-        return
-    if MEGA_HAMMER_4P_ONLY and world.is_2p:
-        return
-    
-    
-    sources = sorted(world.my_planets,
-                     key=lambda p: -(available[p.id] - spent[p.id]))
-    fired_targets = set()
-    fired_count = 0
-    for src in sources:
-        
-        if MEGA_HAMMER_CONCENTRATE_ENABLED and fired_count >= MEGA_HAMMER_MAX_PER_TURN:
-            break
-        avail = available[src.id] - spent[src.id]
-        
-        
-        prod = int(src.production)
-        if FRESH_CAPTURE_INHERITANCE_ENABLED and src.id in _planet_capture_age:
-            threshold = MEGA_HAMMER_SHIPS_MIN_FRESH
-        else:
-            threshold = MEGA_HAMMER_THRESHOLD_BY_PROD.get(prod, MEGA_HAMMER_SHIPS_MIN)
-        if avail < threshold:
-            continue  
-        
-        status = mode_log.get(src.id)
-        if status and status not in ("cheap-pickup", "brain-reserved-lead"):
-            continue
-        
-        best = None
-        for tgt in world.enemy_planets:
-            if tgt.id in target_locked or tgt.id in fired_targets:
-                continue
-            if int(tgt.ships) > MEGA_HAMMER_TARGET_GARRISON_MAX_ITER_H:
-                continue
-            if not is_in_approaching_direction(src, tgt, world.ang_vel):
-                continue
-            aim = aim_at_target(src, tgt, avail, world.initial_by_id,
-                                world.ang_vel, world=world)
-            if aim is None:
-                continue
-            angle, turns = aim
-            if turns > MEGA_HAMMER_MAX_TRAVEL:
-                continue
-            
-            
-            focus_bonus = 0
-            if (F14_4A_2P_FOCUS_ENABLED and world.is_2p
-                    and getattr(world, "focus_enemy_2p", None) is not None
-                    and tgt.owner == world.focus_enemy_2p):
-                focus_bonus = F14_4A_2P_FOCUS_MEGA_BONUS
-            score = (int(tgt.production) + focus_bonus, -int(turns))
-            if best is None or score > best[0]:
-                best = (score, tgt, angle, turns)
-        if best is None:
-            continue
-        _, tgt, angle, turns = best
-        
-        
-        if MEGA_HAMMER_MELIS_VERIFY and turns > 0:
-            proj = forward_project(
-                world,
-                our_capture_target=tgt.id,
-                our_capture_turn=int(turns),
-                our_capture_ships=int(avail),
-                horizon=FWD_SIM_HORIZON + int(turns),
-                project_opponent_moves=True,
-                opponent_emit_fraction=MEGA_HAMMER_VERIFY_OPP_EMIT,
-            )
-            end_owner, _ = proj.get(tgt.id, (-1, 0))
-            if end_owner != world.player:
-                continue
-        _commit_fleet(world, moves, spent, target_locked,
-                      src.id, tgt.id, angle, turns, int(avail))
-        mode_log[src.id] = "mega-hammer-launched"
-        mode_log[tgt.id] = "mega-hammer-target"
-        fired_targets.add(tgt.id)
-        fired_count += 1
-
-
-def handle_hammer(world, available, spent, target_locked, moves, mode_log):
-    """One persistent plan at a time. Plan picks a strong-production enemy
-    target and a set of stockpiles whose combined fleet arriving simultaneously
-    beats defender_at_arrival Ã— overkill. Launches stagger so all fleets land
-    on the same turn. Plan aborts if defender reinforces past committed strength.
-    """
-    global _hammer_plan
-    if not HAMMER_ENABLED:
-        return
-    if not world.enemy_planets:
-        _hammer_plan = None
-        return
-
-    if _hammer_plan is not None:
-        
-        target = world.planet_by_id.get(_hammer_plan["target_id"])
-        if target is None or target.owner == world.player:
-            _hammer_plan = None
-        else:
-            
-            arrival_rel = _hammer_plan["target_arrival_abs"] - world.step
-            if arrival_rel <= 0:
-                _hammer_plan = None
-            else:
-                d_owner, d_ships = predict_defender_at_arrival(world, target, arrival_rel)
-                if d_ships > _hammer_plan["committed_strength"] / HAMMER_ABORT_OVERRUN_RATIO:
-                    _hammer_plan = None
-
-    if _hammer_plan is None:
-        
-        if not _hammer_should_fire(world):
-            return
-        plan = _build_hammer_plan(world, available, spent)
-        if plan is None:
-            return
-        
-        
-        if HAMMER_MELIS_VERIFY:
-            target = world.planet_by_id.get(plan["target_id"])
-            if target is not None:
-                arrival_rel = plan["target_arrival_abs"] - world.step
-                if arrival_rel > 0:
-                    proj = forward_project(
-                        world,
-                        our_capture_target=plan["target_id"],
-                        our_capture_turn=int(arrival_rel),
-                        our_capture_ships=int(plan["committed_strength"]),
-                        horizon=FWD_SIM_HORIZON + arrival_rel,
-                        project_opponent_moves=True,
-                        opponent_emit_fraction=0.30,
-                    )
-                    end_owner, _ = proj.get(plan["target_id"], (-1, 0))
-                    if end_owner != world.player:
-                        return  
-        _hammer_plan = plan
-
-    
-    plan = _hammer_plan
-    completed_launches = []
-    for src_id, launch in list(plan["launches"].items()):
-        if launch.get("fired"):
-            continue
-        if launch["fire_turn_abs"] > world.step:
-            continue  
-        src = world.planet_by_id.get(src_id)
-        if src is None or src.owner != world.player:
-            completed_launches.append(src_id)
-            continue
-        ships = launch["ships"]
-        if ships < HAMMER_MIN_PER_CONTRIBUTOR:
-            completed_launches.append(src_id)
-            continue
-        avail = available[src_id] - spent[src_id]
-        if avail < ships:
-            completed_launches.append(src_id)
-            continue
-        target = world.planet_by_id[plan["target_id"]]
-        
-        aim = aim_at_target(src, target, ships, world.initial_by_id, world.ang_vel, world=world)
-        if aim is None:
-            completed_launches.append(src_id)
-            continue
-        angle, turns = aim
-        _commit_fleet(world, moves, spent, target_locked,
-                      src_id, plan["target_id"], angle, turns, int(ships))
-        mode_log[src_id] = "hammer"
-        launch["fired"] = True
-
-    
-    for sid in completed_launches:
-        plan["launches"].pop(sid, None)
-    if not plan["launches"] or all(l.get("fired") for l in plan["launches"].values()):
-        _hammer_plan = None
-
-
-def _hammer_should_fire(world):
-    """Trigger condition: my prod share >= mode-specific threshold AND a strong
-    enemy production target is reachable, OR we're in late-flush mode."""
-    if world.is_late:
-        return True
-    threshold = world.mode_params["hammer_prod_share"]
-    if world.my_prod_share < threshold:
-        return False
-    return True
-
-
-def _build_hammer_plan(world, available, spent):
-    """Pick best target + stockpile set. Stockpiles are planets with ships >= MIN
-    or promoted-by-idle. Combined arrival fleet must beat defender Ã— overkill.
-    Returns plan dict or None."""
-    
-    
-    stockpile_min = world.mode_params.get("hammer_stockpile_min", HAMMER_STOCKPILE_MIN)
-    stockpiles = []
-    for p in world.my_planets:
-        
-        avail = _routine_avail(world, p, available[p.id] - spent[p.id])
-        if avail < HAMMER_MIN_PER_CONTRIBUTOR:
-            continue
-        promoted = p.id in _promoted_stockpiles
-        if avail < stockpile_min and not promoted:
-            continue
-        stockpiles.append((p, avail))
-    if not stockpiles:
-        return None
-
-    overkill = LATE_FLUSH_OVERKILL_RATIO if world.is_late else world.mode_params["hammer_overkill"]
-
-    targets = [
-        p for p in world.enemy_planets
-        if is_targetable(world, p) and p.production >= HAMMER_TARGET_PROD_MIN
-    ]
-    if not targets:
-        if world.is_late:
-            targets = [p for p in world.enemy_planets if is_targetable(world, p)]
-        if not targets:
-            return None
-
-    best = None
-    for tgt in targets:
-
-        per_src = []
-        for src, avail in stockpiles:
-            if not is_in_approaching_direction(src, tgt, world.ang_vel):
-                continue
-            aim = aim_at_target(src, tgt, max(1, avail), world.initial_by_id, world.ang_vel, world=world)
-            if aim is None:
-                continue
-            angle, turns = aim
-            if turns > HAMMER_MAX_TRAVEL:
-                continue
-            per_src.append((turns, src, avail, angle))
-        if not per_src:
-            continue
-        
-        per_src.sort()  
-        target_arrival = per_src[-1][0]
-        d_owner, d_ships = predict_defender_at_arrival(world, tgt, target_arrival)
-        if d_owner == world.player:
-            continue
-        required = int(math.ceil(d_ships * overkill)) + 1
-
-        
-        accum = 0
-        chosen = []
-        for turns, src, avail, angle in per_src:
-            chosen.append((turns, src, avail, angle))
-            accum += avail
-            if accum >= required:
-                break
-        if accum < required:
-            continue
-
-        
-        
-        slack = accum - required
-        if slack > 0 and chosen:
-            last_turn, last_src, last_avail, last_angle = chosen[-1]
-            
-            
-            
-            oversend_active = (
-                HAMMER_NO_THREAT_OVERSEND_ENABLED
-                and (not HAMMER_NO_THREAT_OVERSEND_2P_ONLY or world.is_2p)
-            )
-            
-            last_src_threat = sum(
-                int(ships) for eta, owner, ships
-                in world.arrivals_by_planet.get(last_src.id, [])
-                if owner != world.player and owner != -1
-            )
-            
-            safe_surplus_ok = (
-                HAMMER_SAFE_SURPLUS_OVERSEND_ENABLED
-                and last_avail >= required * HAMMER_SAFE_SURPLUS_RATIO
-                and last_src_threat <= last_avail * HAMMER_OVERSEND_MAX_THREAT_RATIO
-            )
-            if safe_surplus_ok:
-                
-                pass
-            elif oversend_active and HAMMER_ALWAYS_OVERSEND_2P and world.is_2p:
-                
-                pass
-            elif oversend_active and last_src_threat == 0:
-                
-                pass
-            else:
-                trimmed = last_avail - slack
-                if trimmed < HAMMER_MIN_PER_CONTRIBUTOR:
-                    chosen.pop()
-                    if not chosen or sum(c[2] for c in chosen) < required - last_avail:
-                        chosen.append((last_turn, last_src, last_avail, last_angle))
-                else:
-                    chosen[-1] = (last_turn, last_src, trimmed, last_angle)
-
-        score = required - target_arrival * 0.5  
-        
-        if (F14_4A_2P_FOCUS_ENABLED and world.is_2p
-                and getattr(world, "focus_enemy_2p", None) is not None
-                and tgt.owner == world.focus_enemy_2p):
-            score += F14_4A_2P_FOCUS_HAMMER_BONUS
-        
-        
-        if FLEET_INTENT_ENABLED and tgt.id in _enemy_recently_launched:
-            score += FLEET_INTENT_HAMMER_BONUS
-        
-        
-        if R1_RECAPTURE_PRIORITY_ENABLED and tgt.id in _freshly_lost_planets:
-            score += R1_RECAPTURE_HAMMER_BONUS
-        
-        
-        
-        
-        if not world.is_2p:
-            my_strength = world.owner_strength.get(world.player, 0)
-            enemy_strengths = [
-                (world.owner_strength[o], o)
-                for o in world.owner_strength
-                if o not in (-1, world.player) and world.owner_strength[o] > 0
-            ]
-            if enemy_strengths:
-                max_enemy_strength, max_enemy_owner = max(enemy_strengths)
-                if max_enemy_strength > my_strength and tgt.owner == max_enemy_owner:
-                    score = score - abs(score) * 0.3
-        cand = {
-            "target_id": tgt.id,
-            "target_arrival_abs": world.step + target_arrival,
-            "committed_strength": sum(c[2] for c in chosen),
-            "score": score,
-            "launches": {},
-        }
-        for turns, src, ships, angle in chosen:
-            fire_turn_rel = target_arrival - turns
-            cand["launches"][src.id] = {
-                "fire_turn_abs": world.step + fire_turn_rel,
-                "ships": int(ships),
-                "angle": float(angle),
-                "fired": False,
-            }
-        if best is None or cand["score"] > best["score"]:
-            best = cand
-    return best
-
-
-def handle_multiprong(world, available, spent, target_locked, moves, mode_log):
-    """If a hammer is committed at target T and a credible enemy reinforcer E
-    is pumping ships into T, open a same-turn second prong at E using surplus
-    ships. Strict credibility gates: 2P only, real-reinforcement gate, post-
-    launch garrison gate, prong-credibility gate.
-
-    The picture-1 failure: bot fed all output into one stream against an
-    actively-reinforced target. Two prongs force the opponent to choose:
-    defend T -> we take E (no more reinforcements -> hammer lands clean);
-    defend E -> they pull ships off T (hammer lands clean).
-    """
-    if not MULTIPRONG_ENABLED:
-        return
-    if MULTIPRONG_2P_ONLY and not world.is_2p:
-        return
-    if _hammer_plan is None:
-        return
-
-    target_id = _hammer_plan.get("target_id")
-    target = world.planet_by_id.get(target_id)
-    if target is None or target.owner == world.player or target.owner == -1:
-        return
-    arrival_rel = _hammer_plan.get("target_arrival_abs", world.step) - world.step
-    if arrival_rel <= 0:
-        return
-    committed = int(_hammer_plan.get("committed_strength", 0))
-    if committed <= 0:
-        return
-
-    
-    reinforcer_ships = defaultdict(int)
-    for f in world.fleets:
-        if int(f.ships) <= 0:
-            continue
-        if f.owner == world.player or f.owner == -1:
-            continue
-        ftarget, _eta = fleet_target_planet(
-            f, world.planets, world.initial_by_id, world.ang_vel
-        )
-        if ftarget is None or ftarget.id != target_id:
-            continue
-        reinforcer_ships[int(f.from_planet_id)] += int(f.ships)
-    if not reinforcer_ships:
-        return
-
-    
-    _, defender_at_arrival = predict_defender_at_arrival(world, target, arrival_rel)
-    needed_t = int(math.ceil(defender_at_arrival)) + 1
-    deficit = max(0, needed_t - committed)
-
-    
-    
-    min_reinforce = max(1, int(math.ceil(deficit * MULTIPRONG_REINFORCER_MIN_RATIO)))
-
-    
-    candidates = []
-    for src_id, ship_count in reinforcer_ships.items():
-        src = world.planet_by_id.get(src_id)
-        if src is None:
-            continue
-        if src.owner == world.player or src.owner == -1:
-            continue
-        if ship_count < min_reinforce:
-            continue
-        candidates.append((src, ship_count))
-    if not candidates:
-        return
-    
-    candidates.sort(key=lambda kv: kv[1], reverse=True)
-
-    
-    for reinforcer, in_flight in candidates:
-        if reinforcer.id in target_locked:
-            continue
-        if not is_targetable(world, reinforcer):
-            continue
-        
-        prong = _build_multiprong_attack(world, reinforcer, available, spent, target_locked)
-        if prong is None:
-            continue
-        prong_strength, prong_arrival, prong_landings, e_at_arrival = prong
-
-        
-        
-        if prong_strength <= e_at_arrival * MULTIPRONG_E_OVERKILL:
-            continue
-        
-        needed_e = int(math.ceil(e_at_arrival)) + 1
-        if committed + prong_strength < needed_t + int(round(needed_e * MULTIPRONG_CREDIBILITY_FACTOR)):
-            continue
-
-        
-        for src_id, src, angle, ships, turns in prong_landings:
-            _commit_fleet(
-                world, moves, spent, target_locked,
-                src_id, reinforcer.id, angle, turns, int(ships),
-            )
-            mode_log[src_id] = "multiprong"
-        mode_log[reinforcer.id] = "multiprong-target"
-        return  
-
-
-def _build_multiprong_attack(world, target, available, spent, target_locked):
-    """Plan a 1-3 source attack on `target` from surplus ships (post-hammer,
-    post-expand, post-defense). Returns (strength, arrival_turn, landings, e_at_arrival) or None.
-
-    Each landing: (src_id, src, angle, ships, turns).
-    """
-    sources = []
-    for src in world.my_planets:
-        avail = available[src.id] - spent[src.id]
-        if avail < MULTIPRONG_MIN_PER_CONTRIBUTOR:
-            continue
-        
-        aim = aim_at_target(src, target, max(MULTIPRONG_MIN_PER_CONTRIBUTOR, avail), world.initial_by_id, world.ang_vel, world=world)
-        if aim is None:
-            continue
-        _angle, est_turns = aim
-        if est_turns > MULTIPRONG_MAX_TRAVEL:
-            continue
-        sources.append((est_turns, src, avail))
-    if not sources:
-        return None
-    sources.sort(key=lambda kv: kv[0])  
-
-    
-    chosen = []
-    for est_turns, src, avail in sources[:MULTIPRONG_MAX_PARTICIPANTS]:
-        chosen.append((est_turns, src, avail))
-        common_arrival = max(t for t, _, _ in chosen)
-        _, e_at_arrival = predict_defender_at_arrival(world, target, common_arrival)
-        total_avail = sum(a for _, _, a in chosen)
-        required = int(math.ceil(e_at_arrival * MULTIPRONG_E_OVERKILL)) + 1
-        if total_avail >= required:
-            break
-    common_arrival = max(t for t, _, _ in chosen)
-    _, e_at_arrival = predict_defender_at_arrival(world, target, common_arrival)
-    required = int(math.ceil(e_at_arrival * MULTIPRONG_E_OVERKILL)) + 1
-    total_avail = sum(a for _, _, a in chosen)
-    if total_avail < required:
-        return None
-
-    
-    slack = total_avail - required
-    if slack > 0 and chosen:
-        last_turn, last_src, last_avail = chosen[-1]
-        trimmed = last_avail - slack
-        if trimmed >= MULTIPRONG_MIN_PER_CONTRIBUTOR:
-            chosen[-1] = (last_turn, last_src, trimmed)
-
-    landings = []
-    final_strength = 0
-    for est_turns, src, ships in chosen:
-        if ships < MULTIPRONG_MIN_PER_CONTRIBUTOR:
-            return None
-        aim = aim_at_target(src, target, ships, world.initial_by_id, world.ang_vel, world=world)
-        if aim is None:
-            return None
-        angle, turns = aim
-        if turns > MULTIPRONG_MAX_TRAVEL:
-            return None
-        landings.append((src.id, src, angle, int(ships), int(turns)))
-        final_strength += int(ships)
-
-    final_arrival = max(turns for _, _, _, _, turns in landings)
-    _, final_defender = predict_defender_at_arrival(world, target, final_arrival)
-    final_required = int(math.ceil(final_defender * MULTIPRONG_E_OVERKILL)) + 1
-    if final_strength < final_required:
-        return None
-
-    return final_strength, final_arrival, landings, final_defender
 
 
 def _get_quadrant(planet):
@@ -4932,11 +4118,8 @@ def handle_enemy_assault(world, available, spent, target_locked, moves, mode_log
 
 
 def plan_moves(world, deadline=None):
-    global _planet_idle_counts, _promoted_stockpiles, _pending_commitments
+    global _pending_commitments
 
-    
-    
-    
     def _commitment_viable(c):
         if c["arrival_abs"] <= world.step:
             return False
@@ -4952,7 +4135,6 @@ def plan_moves(world, deadline=None):
         return True
     _pending_commitments[:] = [c for c in _pending_commitments if _commitment_viable(c)]
 
-    
     _update_neutral_watchlist(world)
 
     moves = []
@@ -4960,7 +4142,6 @@ def plan_moves(world, deadline=None):
     target_locked = set()
     mode_log = {}
 
-    
     rescue_needs = {}
     available = {}
     for p in world.my_planets:
@@ -4975,123 +4156,32 @@ def plan_moves(world, deadline=None):
         elif arrivals:
             mode_log[p.id] = "absorb"
 
-    
     def _over_budget():
         return deadline is not None and time.perf_counter() >= deadline
 
-    
     handle_comet_evac(world, available, spent, target_locked, moves, mode_log)
-
-    
-    handle_defense(world, rescue_needs, available, spent, target_locked,
-                   moves, mode_log)
-
-    
-    if not _over_budget():
-        handle_reinforce_min_garrison(world, available, spent, target_locked, moves, mode_log)
+    handle_defense(world, rescue_needs, available, spent, target_locked, moves, mode_log)
 
     if not _over_budget():
         handle_reinforce_surplus(world, available, spent, target_locked, moves, mode_log)
-
     if not _over_budget():
         handle_home_reinforce(world, available, spent, target_locked, moves, mode_log)
-    
-    
-    _brain_reserve_lead(world, available, spent, mode_log)
-    
-    
-    if not _over_budget():
-        if not (SEARCH_EXPAND_4P_ENABLED and not world.is_2p
-                and SEARCH_DISABLES_CHEAP_PICKUP):
-            handle_cheap_pickup(world, available, spent, target_locked, moves, mode_log)
-
-    
     if not _over_budget():
         handle_expand(world, available, spent, target_locked, moves, mode_log)
-
-    
-    
-    if not _over_budget():
-        handle_accumulator(world, available, spent, target_locked, moves, mode_log)
-
-    
-    if not _over_budget():
-        handle_mega_hammer(world, available, spent, target_locked, moves, mode_log)
-
-    
-    if not _over_budget():
-        handle_hammer(world, available, spent, target_locked, moves, mode_log)
-
-    
-    if not _over_budget():
-        handle_multiprong(world, available, spent, target_locked, moves, mode_log)
-
     if not _over_budget():
         handle_intercept(world, available, spent, target_locked, moves, mode_log)
-
     if not _over_budget():
         handle_opportunistic_attack(world, available, spent, target_locked, moves, mode_log)
-
     if not _over_budget():
         handle_frontier_reinforce(world, available, spent, target_locked, moves, mode_log)
-
     if not _over_budget():
         handle_waypoint_capture(world, available, spent, target_locked, moves, mode_log)
-
     if not _over_budget():
         handle_collector_fleets(world, available, spent, target_locked, moves, mode_log)
-
     if not _over_budget():
         handle_enemy_assault(world, available, spent, target_locked, moves, mode_log)
 
-    
-    for p in world.my_planets:
-        if mode_log.get(p.id) and "absorb" not in mode_log[p.id]:
-            _planet_idle_counts[p.id] = 0
-        else:
-            _planet_idle_counts[p.id] = _planet_idle_counts.get(p.id, 0) + 1
-            if _planet_idle_counts[p.id] >= HAMMER_SURROUNDED_PROMOTE_TURNS:
-                _promoted_stockpiles.add(p.id)
-
     return moves
-
-
-def handle_reinforce_min_garrison(world, available, spent, target_locked, moves, mode_log):
-    """Keep each friendly planet at GARRISON_TARGET ships by moving surplus from safe siblings."""
-    min_garrison = GARRISON_TARGET
-    for target in world.my_planets:
-        cur = int(target.ships)
-        if cur >= min_garrison:
-            continue
-        if target.id in mode_log and mode_log[target.id].startswith("absorb"):
-            continue
-        needed = min_garrison - cur
-        best = None
-        for src in world.my_planets:
-            if src.id == target.id:
-                continue
-            avail = available[src.id] - spent[src.id]
-            if avail <= needed:
-                continue
-            if avail < MIN_DISPATCH_SHIPS:
-                continue
-            if sum(int(ships) for eta, owner, ships in world.arrivals_by_planet.get(src.id, [])
-                   if owner != world.player and owner != -1) > 0:
-                continue
-            aim = aim_at_target(src, target, needed, world.initial_by_id, world.ang_vel, world=world)
-            if aim is None:
-                continue
-            angle, turns = aim
-            score = dist(src.x, src.y, target.x, target.y)
-            if best is None or score < best[0]:
-                best = (score, src, angle, turns, needed)
-        if best is None:
-            continue
-        _, src, angle, turns, ships = best
-        _commit_fleet(world, moves, spent, target_locked,
-                      src.id, target.id, angle, turns, int(ships))
-        mode_log[src.id] = "reinforce-min-garrison"
-        mode_log[target.id] = "reinforced"
 
 
 def handle_reinforce_surplus(world, available, spent, target_locked, moves, mode_log):
@@ -5221,9 +4311,6 @@ def agent(obs, config=None):
     obs_step = _read(obs, "step", 0) or 0
     if obs_step == 0:
         _agent_step = 0
-        _hammer_plan = None
-        _planet_idle_counts = {}
-        _promoted_stockpiles = set()
         _pending_commitments = []
         _game_num_players = None
         _2p_patient_streak = 0
