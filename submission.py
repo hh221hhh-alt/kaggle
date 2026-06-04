@@ -125,7 +125,7 @@ DEFENSE_COALITION_MAX = 2
 
 
 
-MIN_DISPATCH_SHIPS = 8
+MIN_DISPATCH_SHIPS = 10
 SURPLUS_SHIP_TRIGGER = 10
 SURPLUS_TARGET_CAP = 10
 
@@ -2004,7 +2004,6 @@ _game_num_players = None
 _2p_patient_streak = 0
 _2p_prod_share_history = []
 
-_collector_positions = {}       # quadrant -> planet_id the collector is currently at
 
 
 
@@ -2890,7 +2889,7 @@ def _try_doom_evac(world, victim, available, spent, target_locked, moves, mode_l
         if not is_targetable(world, dst):
             continue
         aim = aim_at_target(victim, dst, garrison, world.initial_by_id,
-                            world.ang_vel, world=world)
+                            world.ang_vel, world=world, check_approach=True)
         if aim is None:
             continue
         angle, turns = aim
@@ -3727,8 +3726,10 @@ def _try_coalition_expand(world, src, tgt, max_travel, available, spent,
             continue
 
         
-        aim_src = aim_at_target(src, tgt, s_src, world.initial_by_id, world.ang_vel, world=world)
-        aim_p = aim_at_target(p, tgt, s_p, world.initial_by_id, world.ang_vel, world=world)
+        aim_src = aim_at_target(src, tgt, s_src, world.initial_by_id, world.ang_vel,
+                               world=world, check_approach=True)
+        aim_p = aim_at_target(p, tgt, s_p, world.initial_by_id, world.ang_vel,
+                              world=world, check_approach=True)
         if aim_src is None or aim_p is None:
             continue
         a_src, t_src = aim_src
@@ -3784,53 +3785,64 @@ def _build_circuit(planets, world):
 
 
 def handle_collector_fleets(world, available, spent, target_locked, moves, mode_log):
-    """Manage 1-4 collector fleets that snowball surplus ships across friendly planets.
+    """Cascade collector: every planet with surplus forwards it along a circuit,
+    creating a shooting-star wave. Attacks enemy when it can win.
 
-    The board is divided into 4 quadrants. One collector is assigned per occupied
-    quadrant. Each collector tracks which planet it is currently at, picks up
-    surplus ships (above GARRISON_TARGET), tops up any planet below GARRISON_TARGET,
-    and attacks the nearest reachable enemy when the accumulated fleet is large enough.
+    No position tracking needed — every planet in the circuit acts every turn.
+    The cascade naturally builds up a large fleet that rolls through enemies.
     """
-    global _collector_positions
-
-    # Group friendly planets by quadrant
     quadrants = defaultdict(list)
     for p in world.my_planets:
         quadrants[_get_quadrant(p)].append(p)
 
     for q, planets in quadrants.items():
-        if not planets:
-            continue
-
-        # Build the circuit for this quadrant
         circuit = _build_circuit(planets, world)
         if not circuit:
             continue
 
-        # Determine current collector position (default to first planet)
-        cur_id = _collector_positions.get(q)
-        if cur_id not in {p.id for p in planets}:
-            cur_id = circuit[0]
-        _collector_positions[q] = cur_id
-
-        cur_planet = world.planet_by_id.get(cur_id)
-        if cur_planet is None:
-            continue
-
-        avail = available[cur_id] - spent[cur_id]
-        surplus = avail - GARRISON_TARGET
-
-        # --- Priority 1: top up a nearby friendly planet below GARRISON_TARGET ---
-        topped_up = False
-        for p in planets:
-            if p.id == cur_id:
+        for i, pid in enumerate(circuit):
+            planet = world.planet_by_id.get(pid)
+            if planet is None or mode_log.get(pid):
                 continue
-            if int(p.ships) >= GARRISON_TARGET:
+            avail = available[pid] - spent[pid]
+            surplus = avail - GARRISON_TARGET
+            if surplus < GARRISON_TARGET:
                 continue
-            need = GARRISON_TARGET - int(p.ships)
-            if surplus < need:
+
+            # Priority 1: attack reachable enemy or neutral
+            attacked = False
+            all_targets = sorted(
+                [p for p in world.planets
+                 if p.owner != world.player
+                 and p.id not in target_locked
+                 and is_targetable(world, p)],
+                key=lambda p: (-int(p.production), dist(planet.x, planet.y, p.x, p.y))
+            )
+            for tgt in all_targets:
+                if surplus < int(tgt.ships) + 1:
+                    continue
+                aim = aim_at_target(planet, tgt, surplus, world.initial_by_id,
+                                    world.ang_vel, world=world, check_approach=True)
+                if aim is None:
+                    continue
+                angle, turns = aim
+                _commit_fleet(world, moves, spent, target_locked,
+                              pid, tgt.id, angle, turns, int(surplus))
+                mode_log[pid] = "collector-attack"
+                attacked = True
+                break
+
+            if attacked:
                 continue
-            aim = aim_at_target(cur_planet, p, need, world.initial_by_id,
+
+            # Priority 2: cascade to next planet in circuit
+            next_pid = circuit[(i + 1) % len(circuit)]
+            if next_pid == pid:
+                continue
+            next_planet = world.planet_by_id.get(next_pid)
+            if next_planet is None:
+                continue
+            aim = aim_at_target(planet, next_planet, surplus, world.initial_by_id,
                                 world.ang_vel, world=world)
             if aim is None:
                 continue
@@ -3838,85 +3850,8 @@ def handle_collector_fleets(world, available, spent, target_locked, moves, mode_
             if turns > SEGMENT_MAX_TURNS:
                 continue
             _commit_fleet(world, moves, spent, target_locked,
-                          cur_id, p.id, angle, turns, int(need))
-            mode_log[cur_id] = "collector-topup"
-            surplus -= need
-            topped_up = True
-            break
-
-        if topped_up:
-            continue
-
-        if surplus <= 0:
-            # Move collector position to next planet in circuit
-            idx = circuit.index(cur_id) if cur_id in circuit else 0
-            _collector_positions[q] = circuit[(idx + 1) % len(circuit)]
-            continue
-
-        # --- Priority 2: attack a reachable enemy ---
-        attacked = False
-        for tgt in sorted(world.enemy_planets, key=lambda p: -int(p.production)):
-            if tgt.id in target_locked:
-                continue
-            if not is_in_approaching_direction(cur_planet, tgt, world.ang_vel):
-                continue
-            need = int(tgt.ships) + 1
-            if surplus < need:
-                continue
-            aim = aim_at_target(cur_planet, tgt, surplus, world.initial_by_id,
-                                world.ang_vel, world=world)
-            if aim is None:
-                continue
-            angle, turns = aim
-            if turns > SEGMENT_MAX_TURNS:
-                continue
-            _commit_fleet(world, moves, spent, target_locked,
-                          cur_id, tgt.id, angle, turns, int(surplus))
-            mode_log[cur_id] = "collector-attack"
-            mode_log[tgt.id] = "collector-target"
-            attacked = True
-            break
-
-        if attacked:
-            # Reset collector to start of circuit after attacking
-            _collector_positions[q] = circuit[0]
-            continue
-
-        # --- Priority 3: pass surplus to next planet dynamically (idea 2) ---
-        # Pick the planet in this quadrant with the most surplus as the next stop
-        candidates = [
-            p for p in planets
-            if p.id != cur_id
-            and (available[p.id] - spent[p.id]) > GARRISON_TARGET
-        ]
-        if candidates:
-            next_planet = max(candidates,
-                              key=lambda p: available[p.id] - spent[p.id] - GARRISON_TARGET)
-        else:
-            # Fall back to next in circuit order
-            idx = circuit.index(cur_id) if cur_id in circuit else 0
-            next_id = circuit[(idx + 1) % len(circuit)]
-            next_planet = world.planet_by_id.get(next_id)
-        if next_planet is None or next_planet.id == cur_id:
-            continue
-        next_id = next_planet.id
-        if next_planet is None:
-            continue
-        aim = aim_at_target(cur_planet, next_planet, surplus, world.initial_by_id,
-                            world.ang_vel, world=world)
-        if aim is None:
-            _collector_positions[q] = next_id
-            continue
-        angle, turns = aim
-        if turns > SEGMENT_MAX_TURNS:
-            # Too far for one hop; skip to next
-            _collector_positions[q] = next_id
-            continue
-        _commit_fleet(world, moves, spent, target_locked,
-                      cur_id, next_id, angle, turns, int(surplus))
-        mode_log[cur_id] = "collector-snowball"
-        # Advance collector position to the next planet
-        _collector_positions[q] = next_id
+                          pid, next_pid, angle, turns, int(surplus))
+            mode_log[pid] = "collector-cascade"
 
 
 def handle_intercept(world, available, spent, target_locked, moves, mode_log):
@@ -4285,7 +4220,7 @@ def handle_reinforce_surplus(world, available, spent, target_locked, moves, mode
             if fill_amount <= 0:
                 continue
             send_amount = min(send, fill_amount)
-            if send_amount <= 0:
+            if send_amount < GARRISON_TARGET:
                 continue
             aim = aim_at_target(src, tgt, send_amount, world.initial_by_id,
                                 world.ang_vel, world=world)
@@ -4360,7 +4295,6 @@ def agent(obs, config=None):
         _planet_prev_owner.clear()
         _freshly_lost_planets.clear()
         _opp_profile = {}
-        _collector_positions.clear()
     _agent_step += 1
 
     start = time.perf_counter()
