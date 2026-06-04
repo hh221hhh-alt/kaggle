@@ -2750,10 +2750,14 @@ def handle_defense(world, rescue_needs, available, spent, target_locked,
             avail = available[src.id] - spent[src.id]
             if avail < need:
                 continue
+            if avail < MIN_DISPATCH_SHIPS:
+                continue
             aim = aim_at_target(src, victim, avail, world.initial_by_id, world.ang_vel, world=world)
             if aim is None:
                 continue
             angle, turns = aim
+            if turns > SEGMENT_MAX_TURNS:
+                continue
             if deadline is not None and turns > deadline:
                 continue
             solo.append((turns, src.id, src, angle, avail))
@@ -4023,39 +4027,40 @@ def handle_home_attack(world, available, spent, target_locked, moves, mode_log):
             if mode_log.get(src.id):
                 continue
             avail = available[src.id] - spent[src.id]
-            if avail < int(tgt.ships) + 1:
+            need = int(tgt.ships) + 1
+            if avail < max(need, MIN_DISPATCH_SHIPS):
                 continue
-            aim = aim_at_target(src, tgt, avail, world.initial_by_id,
+            send = max(need, MIN_DISPATCH_SHIPS)
+            aim = aim_at_target(src, tgt, send, world.initial_by_id,
                                 world.ang_vel, world=world, check_approach=True)
             if aim is None:
                 continue
             angle, turns = aim
             _commit_fleet(world, moves, spent, target_locked,
-                          src.id, tgt.id, angle, turns, int(avail))
+                          src.id, tgt.id, angle, turns, int(send))
             mode_log[src.id] = "home-attack"
             mode_log[tgt.id] = "home-attack-target"
             break
 
 
 def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
-    """Fire surplus ships (above GARRISON_TARGET) at the best approaching target.
-    Trigger: avail >= GARRISON_TARGET + 10. Fires all surplus in one shot.
-    Also handles collector-style attack (回収攻撃).
+    """Fire exactly GARRISON_TARGET (10) ships when surplus >= 10.
+    Only targets planets whose garrison <= 9 (beatable with 10 ships).
+    Creates a steady stream of small fleets rather than one big shot.
     """
-    FIRE_THRESHOLD = GARRISON_TARGET + 10
+    send = GARRISON_TARGET
     for src in world.my_planets:
         if mode_log.get(src.id):
             continue
         avail = available[src.id] - spent[src.id]
-        if avail < FIRE_THRESHOLD:
+        if avail < GARRISON_TARGET * 2:  # need 20 to fire 10 and keep 10
             continue
-        send = avail - GARRISON_TARGET
-        # Find best target: enemy first (by production), then neutral
         targets = sorted(
             [p for p in world.planets
              if p.owner != world.player
              and p.id not in target_locked
-             and is_targetable(world, p)],
+             and is_targetable(world, p)
+             and int(p.ships) < send],  # only attack planets we can beat with 10
             key=lambda p: (-int(p.production), dist(src.x, src.y, p.x, p.y))
         )
         for tgt in targets:
@@ -4227,6 +4232,8 @@ def handle_reinforce_surplus(world, available, spent, target_locked, moves, mode
             if aim is None:
                 continue
             angle, turns = aim
+            if turns > SEGMENT_MAX_TURNS:
+                continue
             _commit_fleet(world, moves, spent, target_locked,
                           src.id, tgt.id, angle, turns, int(send_amount))
             mode_log[src.id] = "surplus-collect"
