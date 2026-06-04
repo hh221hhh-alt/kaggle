@@ -4070,6 +4070,71 @@ def handle_waypoint_capture(world, available, spent, target_locked, moves, mode_
             break
 
 
+def handle_home_attack(world, available, spent, target_locked, moves, mode_log):
+    """Attack enemy planets inside our home zone with priority."""
+    if world.home_center is None or not world.enemy_planets:
+        return
+    hx, hy = world.home_center
+    dist_limit = HOME_RETURN_DIST_2P if world.is_2p else HOME_RETURN_DIST_4P
+    home_enemies = [p for p in world.enemy_planets
+                    if dist(p.x, p.y, hx, hy) <= dist_limit
+                    and p.id not in target_locked]
+    if not home_enemies:
+        return
+    home_enemies.sort(key=lambda p: int(p.ships))
+    for tgt in home_enemies:
+        for src in sorted(world.my_planets,
+                          key=lambda p: dist(p.x, p.y, tgt.x, tgt.y)):
+            if mode_log.get(src.id):
+                continue
+            avail = available[src.id] - spent[src.id]
+            if avail < int(tgt.ships) + 1:
+                continue
+            aim = aim_at_target(src, tgt, avail, world.initial_by_id,
+                                world.ang_vel, world=world, check_approach=True)
+            if aim is None:
+                continue
+            angle, turns = aim
+            _commit_fleet(world, moves, spent, target_locked,
+                          src.id, tgt.id, angle, turns, int(avail))
+            mode_log[src.id] = "home-attack"
+            mode_log[tgt.id] = "home-attack-target"
+            break
+
+
+def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
+    """Fire surplus ships (above GARRISON_TARGET) at the best approaching target.
+    Trigger: avail >= GARRISON_TARGET + 10. Fires all surplus in one shot.
+    Also handles collector-style attack (回収攻撃).
+    """
+    FIRE_THRESHOLD = GARRISON_TARGET + 10
+    for src in world.my_planets:
+        if mode_log.get(src.id):
+            continue
+        avail = available[src.id] - spent[src.id]
+        if avail < FIRE_THRESHOLD:
+            continue
+        send = avail - GARRISON_TARGET
+        # Find best target: enemy first (by production), then neutral
+        targets = sorted(
+            [p for p in world.planets
+             if p.owner != world.player
+             and p.id not in target_locked
+             and is_targetable(world, p)],
+            key=lambda p: (-int(p.production), dist(src.x, src.y, p.x, p.y))
+        )
+        for tgt in targets:
+            aim = aim_at_target(src, tgt, send, world.initial_by_id,
+                                world.ang_vel, world=world, check_approach=True)
+            if aim is None:
+                continue
+            angle, turns = aim
+            _commit_fleet(world, moves, spent, target_locked,
+                          src.id, tgt.id, angle, turns, int(send))
+            mode_log[src.id] = "steady-fire"
+            break
+
+
 def handle_enemy_assault(world, available, spent, target_locked, moves, mode_log):
     """Launch all-out attack on all enemy planets when we have ENEMY_ASSAULT_RATIO times
     their total garrison. Targets sorted by production (highest first).
@@ -4163,9 +4228,13 @@ def plan_moves(world, deadline=None):
     handle_defense(world, rescue_needs, available, spent, target_locked, moves, mode_log)
 
     if not _over_budget():
-        handle_reinforce_surplus(world, available, spent, target_locked, moves, mode_log)
+        handle_home_attack(world, available, spent, target_locked, moves, mode_log)
     if not _over_budget():
         handle_home_reinforce(world, available, spent, target_locked, moves, mode_log)
+    if not _over_budget():
+        handle_reinforce_surplus(world, available, spent, target_locked, moves, mode_log)
+    if not _over_budget():
+        handle_steady_fire(world, available, spent, target_locked, moves, mode_log)
     if not _over_budget():
         handle_expand(world, available, spent, target_locked, moves, mode_log)
     if not _over_budget():
@@ -4231,9 +4300,8 @@ def handle_reinforce_surplus(world, available, spent, target_locked, moves, mode
 
 
 def handle_home_reinforce(world, available, spent, target_locked, moves, mode_log):
-    """Return ships to home area when they drift too far from the initial home center.
-    Uses distance threshold: HOME_RETURN_DIST_2P for 2P, HOME_RETURN_DIST_4P for 4P.
-    Also tries to recapture non-friendly planets inside the home radius.
+    """Full evacuation of outside-territory planets back to home zone.
+    Sends ALL available ships (no reserve left behind) to the nearest home planet.
     """
     if world.home_center is None:
         return
@@ -4246,65 +4314,35 @@ def handle_home_reinforce(world, available, spent, target_locked, moves, mode_lo
         return
     home_planets = [p for p in world.my_planets
                     if dist(p.x, p.y, hx, hy) <= dist_limit]
-
-    # Non-friendly planets inside our home radius (recapture priority)
-    home_targets = [p for p in world.planets
-                    if p.owner != world.player
-                    and dist(p.x, p.y, hx, hy) <= dist_limit]
-    home_targets.sort(key=lambda p: dist(p.x, p.y, hx, hy))
+    if not home_planets:
+        return
 
     for src in away_planets:
-        if src.id in mode_log and mode_log[src.id] not in ("reinforce-min-garrison",):
+        if mode_log.get(src.id):
             continue
+        # Send ALL ships — full evacuation, no reserve
         avail = available[src.id] - spent[src.id]
-        if avail <= GARRISON_TARGET:
-            continue
-        if sum(int(ships) for eta, owner, ships in world.arrivals_by_planet.get(src.id, [])
-               if owner != world.player and owner != -1) > 0:
-            continue
-        send = avail - GARRISON_TARGET
-
-        # First try to recapture a non-friendly planet inside home area
-        captured = False
-        for tgt in home_targets:
-            if tgt.id in target_locked:
-                continue
-            if not is_targetable(world, tgt):
-                continue
-            plan = plan_solo_capture(world, src, tgt, send, max_travel=SEGMENT_MAX_TURNS)
-            if plan is None:
-                continue
-            angle, turns, ships = plan
-            _commit_fleet(world, moves, spent, target_locked,
-                          src.id, tgt.id, angle, turns, int(ships))
-            mode_log[src.id] = "home-recapture"
-            mode_log[tgt.id] = "home-recaptured"
-            captured = True
-            break
-        if captured:
-            continue
-
-        # Send surplus toward the closest home planet
-        if not home_planets:
+        if avail <= 0:
             continue
         target = min(home_planets, key=lambda p: dist(src.x, src.y, p.x, p.y))
         if target.id == src.id:
             continue
-        aim = aim_at_target(src, target, send, world.initial_by_id, world.ang_vel, world=world)
+        aim = aim_at_target(src, target, avail, world.initial_by_id,
+                            world.ang_vel, world=world)
         if aim is None:
             continue
         angle, turns = aim
         if turns > SEGMENT_MAX_TURNS:
             continue
         _commit_fleet(world, moves, spent, target_locked,
-                      src.id, target.id, angle, turns, int(send))
-        mode_log[src.id] = "home-reinforce"
+                      src.id, target.id, angle, turns, int(avail))
+        mode_log[src.id] = "home-evac"
         mode_log[target.id] = "home-receive"
 
 
 
 def agent(obs, config=None):
-    global _agent_step, _hammer_plan, _planet_idle_counts, _promoted_stockpiles, _pending_commitments
+    global _agent_step, _pending_commitments
     global _game_num_players, _2p_patient_streak, _2p_prod_share_history
 
     global _opp_profile  
