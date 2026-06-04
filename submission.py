@@ -133,6 +133,8 @@ AIM_MAX_ITERS = 8
 AIM_CONVERGE_DIST = 0.5
 AIM_CONVERGE_TURNS = 1
 
+ATTACK_MAX_SHIPS = 20          # non-collector attack cap
+
 COMET_EVAC_REMAINING_TURNS = 8
 COMET_EVAC_MIN_SHIPS = 5
 
@@ -3768,10 +3770,23 @@ def _try_coalition_expand(world, src, tgt, max_travel, available, spent,
 
 
 def _get_quadrant(planet):
-    """Return 0-3 based on planet position (NW=0, NE=1, SW=2, SE=3)."""
+    """Return 0-3: NW=0, SW=1, NE=2, SE=3."""
     x_half = 1 if planet.x >= CENTER_X else 0
     y_half = 1 if planet.y >= CENTER_Y else 0
     return x_half * 2 + y_half
+
+
+# Clockwise rotation: SE(3)→NE(2)→NW(0)→SW(1)→SE(3)
+_CW_NEXT  = {3: 2, 2: 0, 0: 1, 1: 3}
+# Counter-clockwise: SE(3)→SW(1)→NW(0)→NE(2)→SE(3)
+_CCW_NEXT = {3: 1, 1: 0, 0: 2, 2: 3}
+
+
+def _frontier_quadrant(q, ang_vel):
+    """One step ahead in the rotation direction = the frontier."""
+    if abs(ang_vel) < 1e-9:
+        return q
+    return _CW_NEXT[q] if ang_vel < 0 else _CCW_NEXT[q]
 
 
 def _build_circuit(planets, world):
@@ -3789,73 +3804,104 @@ def _build_circuit(planets, world):
 
 
 def handle_collector_fleets(world, available, spent, target_locked, moves, mode_log):
-    """Cascade collector: every planet with surplus forwards it along a circuit,
-    creating a shooting-star wave. Attacks enemy when it can win.
-
-    No position tracking needed — every planet in the circuit acts every turn.
-    The cascade naturally builds up a large fleet that rolls through enemies.
+    """One collector per quadrant. The planet with the most ships is the active
+    collector. It carries ALL surplus (snowball) and moves toward the frontier
+    quadrant. Attacks immediately if it can win.
     """
     quadrants = defaultdict(list)
     for p in world.my_planets:
         quadrants[_get_quadrant(p)].append(p)
 
     for q, planets in quadrants.items():
-        circuit = _build_circuit(planets, world)
-        if not circuit:
+        if not planets:
             continue
 
-        for i, pid in enumerate(circuit):
-            planet = world.planet_by_id.get(pid)
-            if planet is None or mode_log.get(pid):
-                continue
-            avail = available[pid] - spent[pid]
-            surplus = avail - GARRISON_TARGET
-            if surplus < GARRISON_TARGET:
-                continue
+        # Active collector = planet with most available ships in this quadrant
+        collector = max(planets, key=lambda p: available[p.id] - spent[p.id])
+        pid = collector.id
 
-            # Priority 1: attack reachable enemy or neutral
-            attacked = False
-            all_targets = sorted(
-                [p for p in world.planets
-                 if p.owner != world.player
-                 and p.id not in target_locked
-                 and is_targetable(world, p)],
-                key=lambda p: (-int(p.production), dist(planet.x, planet.y, p.x, p.y))
-            )
-            for tgt in all_targets:
-                if surplus < int(tgt.ships) + 1:
-                    continue
-                aim = aim_at_target(planet, tgt, surplus, world.initial_by_id,
-                                    world.ang_vel, world=world, check_approach=True)
-                if aim is None:
-                    continue
-                angle, turns = aim
-                _commit_fleet(world, moves, spent, target_locked,
-                              pid, tgt.id, angle, turns, int(surplus))
-                mode_log[pid] = "collector-attack"
-                attacked = True
-                break
+        if mode_log.get(pid):
+            continue
 
-            if attacked:
-                continue
+        avail = available[pid] - spent[pid]
+        surplus = avail - GARRISON_TARGET
+        if surplus < GARRISON_TARGET:
+            continue
 
-            # Priority 2: cascade to next planet in circuit
-            next_pid = circuit[(i + 1) % len(circuit)]
-            if next_pid == pid:
+        # Priority 1: attack immediately if we can win
+        all_targets = sorted(
+            [p for p in world.planets
+             if p.owner != world.player
+             and p.id not in target_locked
+             and is_targetable(world, p)],
+            key=lambda p: (-int(p.production), dist(collector.x, collector.y, p.x, p.y))
+        )
+        attacked = False
+        for tgt in all_targets:
+            if surplus < int(tgt.ships) + 1:
                 continue
-            next_planet = world.planet_by_id.get(next_pid)
-            if next_planet is None:
-                continue
-            aim = aim_at_target(planet, next_planet, surplus, world.initial_by_id,
-                                world.ang_vel, world=world)
+            aim = aim_at_target(collector, tgt, surplus, world.initial_by_id,
+                                world.ang_vel, world=world, check_approach=True)
             if aim is None:
                 continue
             angle, turns = aim
-            if turns > SEGMENT_MAX_TURNS:
-                continue
             _commit_fleet(world, moves, spent, target_locked,
-                          pid, next_pid, angle, turns, int(surplus))
-            mode_log[pid] = "collector-cascade"
+                          pid, tgt.id, angle, turns, int(surplus))
+            mode_log[pid] = "collector-attack"
+            attacked = True
+            break
+
+        if attacked:
+            continue
+
+        # Priority 2: move toward frontier quadrant
+        frontier_q = _frontier_quadrant(q, world.ang_vel)
+        frontier_planets = [p for p in world.my_planets
+                            if _get_quadrant(p) == frontier_q and p.id != pid]
+
+        next_planet = None
+        # Try frontier planets first (sorted by distance)
+        for fp in sorted(frontier_planets,
+                         key=lambda p: dist(collector.x, collector.y, p.x, p.y)):
+            aim = aim_at_target(collector, fp, surplus, world.initial_by_id,
+                                world.ang_vel, world=world)
+            if aim is None:
+                continue
+            _, turns = aim
+            if turns <= SEGMENT_MAX_TURNS:
+                next_planet = fp
+                break
+
+        # Fall back: nearest reachable planet in any quadrant
+        if next_planet is None:
+            circuit = _build_circuit(planets, world)
+            if len(circuit) > 1:
+                idx = circuit.index(pid) if pid in circuit else 0
+                for j in range(1, len(circuit)):
+                    nid = circuit[(idx + j) % len(circuit)]
+                    np = world.planet_by_id.get(nid)
+                    if np is None:
+                        continue
+                    aim = aim_at_target(collector, np, surplus, world.initial_by_id,
+                                        world.ang_vel, world=world)
+                    if aim is None:
+                        continue
+                    _, turns = aim
+                    if turns <= SEGMENT_MAX_TURNS:
+                        next_planet = np
+                        break
+
+        if next_planet is None:
+            continue
+
+        aim = aim_at_target(collector, next_planet, surplus, world.initial_by_id,
+                            world.ang_vel, world=world)
+        if aim is None:
+            continue
+        angle, turns = aim
+        _commit_fleet(world, moves, spent, target_locked,
+                      pid, next_planet.id, angle, turns, int(surplus))
+        mode_log[pid] = "collector-cascade"
 
 
 def handle_intercept(world, available, spent, target_locked, moves, mode_log):
@@ -3884,19 +3930,18 @@ def handle_intercept(world, available, spent, target_locked, moves, mode_log):
                                    key=lambda mp: dist(mp.x, mp.y, src_planet.x, src_planet.y)):
                     avail = available[my_p.id] - spent[my_p.id]
                     need = int(src_planet.ships) + 1
-                    if avail < need:
+                    send = max(MIN_DISPATCH_SHIPS, min(need, ATTACK_MAX_SHIPS))
+                    if avail < send or need > ATTACK_MAX_SHIPS:
                         continue
                     if not is_in_approaching_direction(my_p, src_planet, world.ang_vel):
                         continue
-                    aim = aim_at_target(my_p, src_planet, avail, world.initial_by_id,
-                                        world.ang_vel, world=world)
+                    aim = aim_at_target(my_p, src_planet, send, world.initial_by_id,
+                                        world.ang_vel, world=world, check_approach=True)
                     if aim is None:
                         continue
                     angle, turns = aim
-                    if turns > SEGMENT_MAX_TURNS:
-                        continue
                     _commit_fleet(world, moves, spent, target_locked,
-                                  my_p.id, src_planet.id, angle, turns, int(avail))
+                                  my_p.id, src_planet.id, angle, turns, int(send))
                     mode_log[my_p.id] = "intercept"
                     mode_log[src_planet.id] = "intercept-target"
                     attacked.add(src_planet.id)
@@ -3957,19 +4002,20 @@ def handle_opportunistic_attack(world, available, spent, target_locked, moves, m
                 continue
             avail = available[src.id] - spent[src.id]
             need = int(tgt.ships) + 1
-            if avail < need:
+            if need > ATTACK_MAX_SHIPS:
+                continue
+            send = max(MIN_DISPATCH_SHIPS, min(need, ATTACK_MAX_SHIPS))
+            if avail < send:
                 continue
             if not is_in_approaching_direction(src, tgt, world.ang_vel):
                 continue
-            aim = aim_at_target(src, tgt, avail, world.initial_by_id,
-                                world.ang_vel, world=world)
+            aim = aim_at_target(src, tgt, send, world.initial_by_id,
+                                world.ang_vel, world=world, check_approach=True)
             if aim is None:
                 continue
             angle, turns = aim
-            if turns > SEGMENT_MAX_TURNS:
-                continue
             _commit_fleet(world, moves, spent, target_locked,
-                          src.id, tgt.id, angle, turns, int(avail))
+                          src.id, tgt.id, angle, turns, int(send))
             mode_log[src.id] = "opportunistic-attack"
             mode_log[tgt.id] = "opportunistic-target"
             break
@@ -4091,6 +4137,10 @@ def handle_enemy_assault(world, available, spent, target_locked, moves, mode_log
             continue
         if not is_targetable(world, tgt):
             continue
+        need = int(tgt.ships) + 1
+        if need > ATTACK_MAX_SHIPS:
+            continue
+        send = max(MIN_DISPATCH_SHIPS, min(need, ATTACK_MAX_SHIPS))
         best_src = None
         best_d = float("inf")
         for src in world.my_planets:
@@ -4098,26 +4148,22 @@ def handle_enemy_assault(world, available, spent, target_locked, moves, mode_log
             if status and status not in ("surplus-collect", "absorb"):
                 continue
             avail = available[src.id] - spent[src.id]
-            need = int(tgt.ships) + 1
-            if avail < need:
+            if avail < send:
                 continue
-            if not is_in_approaching_direction(src, tgt, world.ang_vel):
-                continue
-            aim = aim_at_target(src, tgt, avail, world.initial_by_id, world.ang_vel, world=world)
+            aim = aim_at_target(src, tgt, send, world.initial_by_id, world.ang_vel,
+                                world=world, check_approach=True)
             if aim is None:
                 continue
             angle, turns = aim
-            if turns > SEGMENT_MAX_TURNS:
-                continue
             d = dist(src.x, src.y, tgt.x, tgt.y)
             if d < best_d:
                 best_d = d
-                best_src = (src, angle, turns, avail)
+                best_src = (src, angle, turns)
         if best_src is None:
             continue
-        src, angle, turns, avail = best_src
+        src, angle, turns = best_src
         _commit_fleet(world, moves, spent, target_locked,
-                      src.id, tgt.id, angle, turns, int(avail))
+                      src.id, tgt.id, angle, turns, int(send))
         mode_log[src.id] = "assault"
         mode_log[tgt.id] = "assault-target"
 
