@@ -128,6 +128,10 @@ MIN_DISPATCH_SHIPS = 8
 SURPLUS_SHIP_TRIGGER = 10
 SURPLUS_TARGET_CAP = 10
 
+AIM_MAX_ITERS = 8
+AIM_CONVERGE_DIST = 0.5
+AIM_CONVERGE_TURNS = 1
+
 GARRISON_TARGET = 10           # keep each planet at this many ships
 SEGMENT_MAX_TURNS = 5          # never fire if arrival takes more than this many turns
 HOME_RETURN_DIST_2P = 35.0     # send ships home if farther than this (2P)
