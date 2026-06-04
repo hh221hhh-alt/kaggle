@@ -2587,9 +2587,8 @@ def _commit_fleet(world, moves, spent, target_locked,
             return
         src_obj = world.planet_by_id.get(int(src_id))
         if src_obj is not None:
-            pred_x, pred_y = predict_target_position(tgt_obj, world, int(turns))
-            if not is_in_approaching_direction(src_obj, tgt_obj, world.ang_vel,
-                                               tx=pred_x, ty=pred_y):
+            # Use current position for direction check (simpler and reliable)
+            if not is_in_approaching_direction(src_obj, tgt_obj, world.ang_vel):
                 return
     moves.append([src_id, float(angle), int(ships)])
     spent[src_id] += int(ships)
@@ -3129,9 +3128,27 @@ def _handle_search_expand_4p(world, available, spent, target_locked, moves, mode
     return committed_sources
 
 
+def _home_zone_clear(world):
+    """Return True if no enemy/neutral planets exist inside our home zone."""
+    if world.home_center is None:
+        return True
+    hx, hy = world.home_center
+    dist_limit = HOME_RETURN_DIST_2P if world.is_2p else HOME_RETURN_DIST_4P
+    for p in world.planets:
+        if p.owner == world.player:
+            continue
+        if dist(p.x, p.y, hx, hy) <= dist_limit:
+            return False
+    return True
+
+
 def handle_expand(world, available, spent, target_locked, moves, mode_log):
-    
+
     if LAUNCH_BLACKOUT_ENABLED and world.step >= TOTAL_STEPS - LAUNCH_BLACKOUT_TURNS:
+        return
+
+    # Don't expand outside home zone until home zone is cleared
+    if not _home_zone_clear(world):
         return
     
     if (SEARCH_EXPAND_4P_ENABLED and not world.is_2p) or \
@@ -4104,22 +4121,29 @@ def handle_home_attack(world, available, spent, target_locked, moves, mode_log):
 
 def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
     """Fire exactly GARRISON_TARGET (10) ships when surplus >= 10.
-    Only targets planets whose garrison <= 9 (beatable with 10 ships).
-    Creates a steady stream of small fleets rather than one big shot.
+    Restricts to home zone targets when home zone is not yet cleared.
     """
     send = GARRISON_TARGET
+    home_clear = _home_zone_clear(world)
+    hx = hy = None
+    dist_limit = None
+    if not home_clear and world.home_center is not None:
+        hx, hy = world.home_center
+        dist_limit = HOME_RETURN_DIST_2P if world.is_2p else HOME_RETURN_DIST_4P
+
     for src in world.my_planets:
         if mode_log.get(src.id):
             continue
         avail = available[src.id] - spent[src.id]
-        if avail < GARRISON_TARGET * 2:  # need 20 to fire 10 and keep 10
+        if avail < GARRISON_TARGET * 2:
             continue
         targets = sorted(
             [p for p in world.planets
              if p.owner != world.player
              and p.id not in target_locked
              and is_targetable(world, p)
-             and int(p.ships) < send],  # only attack planets we can beat with 10
+             and int(p.ships) < send
+             and (home_clear or (hx is not None and dist(p.x, p.y, hx, hy) <= dist_limit))],
             key=lambda p: (-int(p.production), dist(src.x, src.y, p.x, p.y))
         )
         for tgt in targets:
