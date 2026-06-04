@@ -3820,11 +3820,14 @@ def _frontier_quadrant(q, ang_vel):
 
 
 def _build_circuit(planets, world):
-    """Build a greedy nearest-neighbor tour through the given planets."""
+    """Build a greedy nearest-neighbor tour through the given planets.
+    Returns list of planet IDs.
+    """
     if not planets:
         return []
     remaining = list(planets)
-    circuit = [remaining.pop(0)]
+    first = remaining.pop(0)
+    circuit = [first.id]
     while remaining:
         last_p = world.planet_by_id[circuit[-1]]
         nearest = min(remaining, key=lambda p: dist(p.x, p.y, last_p.x, last_p.y))
