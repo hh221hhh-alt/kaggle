@@ -3107,8 +3107,7 @@ def _handle_search_expand_4p(world, available, spent, target_locked, moves, mode
             continue
         
         if world.stop_expand_lax and tgt is not None and tgt.owner == -1:
-            if not _is_cheap_neutral_pick(world, tgt):
-                continue
+            continue
         if tgt is not None and tgt.owner == -1:
             turns_act = int(act["arrival_turn"])
             ships_act = int(act["ships"])
@@ -3155,10 +3154,7 @@ def handle_expand(world, available, spent, target_locked, moves, mode_log):
         nonfriendly = [p for p in nonfriendly if p.owner != -1]
     
     elif world.stop_expand_lax:
-        nonfriendly = [
-            p for p in nonfriendly
-            if p.owner != -1 or _is_cheap_neutral_pick(world, p)
-        ]
+        nonfriendly = [p for p in nonfriendly if p.owner != -1]
     if not nonfriendly:
         return
 
@@ -3169,14 +3165,14 @@ def handle_expand(world, available, spent, target_locked, moves, mode_log):
 
     for src in sources:
         
-        avail = _routine_avail(world, src, available[src.id] - spent[src.id])
+        avail = available[src.id] - spent[src.id]
         if avail < MIN_DISPATCH_SHIPS:
             continue
         
         
         status = mode_log.get(src.id)
-        if status and status != "cheap-pickup":
-            continue  
+        if status:
+            continue
 
         candidates = _nearest_targets(src, world, K, max_travel, target_locked)
         fired_solo = False
