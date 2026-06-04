@@ -124,9 +124,15 @@ DEFENSE_COALITION_MAX = 2
 
 
 
-MIN_DISPATCH_SHIPS = 8          
+MIN_DISPATCH_SHIPS = 8
 SURPLUS_SHIP_TRIGGER = 10
 SURPLUS_TARGET_CAP = 10
+
+GARRISON_TARGET = 10           # keep each planet at this many ships
+SEGMENT_MAX_TURNS = 5          # never fire if arrival takes more than this many turns
+HOME_RETURN_DIST_2P = 35.0     # send ships home if farther than this (2P)
+HOME_RETURN_DIST_4P = 22.0     # send ships home if farther than this (4P)
+ENEMY_ASSAULT_RATIO = 1.5      # launch all-out attack when we have this multiple of enemy garrison
 
 F3_THREE_BUCKET_ENABLED = True
 F3_SAFE_FLOOR = 5
@@ -710,6 +716,28 @@ def orbital_target_approaching(src, target, world):
     nx = CENTER_X + r * math.cos(next_angle)
     ny = CENTER_Y + r * math.sin(next_angle)
     return dist(src.x, src.y, nx, ny) < dist(src.x, src.y, target.x, target.y)
+
+
+
+def is_in_approaching_direction(src, target, ang_vel):
+    """Return True only if target is in the direction opposite to the board's rotation flow.
+    Clockwise rotation (ang_vel < 0) → only shoot counter-clockwise (delta > 0).
+    Counter-clockwise rotation (ang_vel > 0) → only shoot clockwise (delta < 0).
+    No rotation → allow any direction.
+    """
+    if abs(ang_vel) < 1e-9:
+        return True
+    src_angle = math.atan2(src.y - CENTER_Y, src.x - CENTER_X)
+    tgt_angle = math.atan2(target.y - CENTER_Y, target.x - CENTER_X)
+    delta = tgt_angle - src_angle
+    while delta > math.pi:
+        delta -= 2 * math.pi
+    while delta < -math.pi:
+        delta += 2 * math.pi
+    if ang_vel < 0:
+        return delta > 0
+    else:
+        return delta < 0
 
 
 
@@ -2553,12 +2581,14 @@ def plan_solo_capture(world, src, tgt, max_avail, max_travel):
         min_floor = 5 if (world.is_2p and raw_dist < 12.0) else MIN_DISPATCH_SHIPS
     if max_avail < min_floor:
         return None
-    if not orbital_target_approaching(src, tgt, world):
+    if not is_in_approaching_direction(src, tgt, world.ang_vel):
         return None
     aim = aim_at_target(src, tgt, max_avail, world.initial_by_id, world.ang_vel, world=world)
     if aim is None:
         return None
     angle, turns = aim
+    if turns > SEGMENT_MAX_TURNS:
+        return None
     if turns > max_travel:
         return None
     need = effective_needed_to_capture(tgt, turns, world)  
@@ -2588,9 +2618,11 @@ def plan_solo_capture(world, src, tgt, max_avail, max_travel):
     if aim2 is None:
         return None
     angle, turns = aim2
+    if turns > SEGMENT_MAX_TURNS:
+        return None
     if turns > max_travel:
         return None
-    need2 = effective_needed_to_capture(tgt, turns, world)  
+    need2 = effective_needed_to_capture(tgt, turns, world)
     if ships < need2 + margin:
         ships = need2 + margin
         if ships > max_avail:
@@ -2599,6 +2631,8 @@ def plan_solo_capture(world, src, tgt, max_avail, max_travel):
         if aim3 is None:
             return None
         angle, turns = aim3
+        if turns > SEGMENT_MAX_TURNS:
+            return None
         if turns > max_travel:
             return None
     
@@ -4494,6 +4528,53 @@ def _build_multiprong_attack(world, target, available, spent, target_locked):
     return final_strength, final_arrival, landings, final_defender
 
 
+def handle_enemy_assault(world, available, spent, target_locked, moves, mode_log):
+    """Launch all-out attack on all enemy planets when we have ENEMY_ASSAULT_RATIO times
+    their total garrison. Targets sorted by production (highest first).
+    """
+    if not world.enemy_planets:
+        return
+    enemy_total = sum(int(p.ships) for p in world.enemy_planets)
+    my_available = sum(max(0, available[p.id] - spent[p.id]) for p in world.my_planets)
+    if my_available < enemy_total * ENEMY_ASSAULT_RATIO:
+        return
+
+    for tgt in sorted(world.enemy_planets, key=lambda p: -int(p.production)):
+        if tgt.id in target_locked:
+            continue
+        if not is_targetable(world, tgt):
+            continue
+        best_src = None
+        best_d = float("inf")
+        for src in world.my_planets:
+            status = mode_log.get(src.id)
+            if status and status not in ("surplus-collect", "absorb"):
+                continue
+            avail = available[src.id] - spent[src.id]
+            need = int(tgt.ships) + 1
+            if avail < need:
+                continue
+            if not is_in_approaching_direction(src, tgt, world.ang_vel):
+                continue
+            aim = aim_at_target(src, tgt, avail, world.initial_by_id, world.ang_vel, world=world)
+            if aim is None:
+                continue
+            angle, turns = aim
+            if turns > SEGMENT_MAX_TURNS:
+                continue
+            d = dist(src.x, src.y, tgt.x, tgt.y)
+            if d < best_d:
+                best_d = d
+                best_src = (src, angle, turns, avail)
+        if best_src is None:
+            continue
+        src, angle, turns, avail = best_src
+        _commit_fleet(world, moves, spent, target_locked,
+                      src.id, tgt.id, angle, turns, int(avail))
+        mode_log[src.id] = "assault"
+        mode_log[tgt.id] = "assault-target"
+
+
 def plan_moves(world, deadline=None):
     global _planet_idle_counts, _promoted_stockpiles, _pending_commitments
 
@@ -4589,6 +4670,9 @@ def plan_moves(world, deadline=None):
     if not _over_budget():
         handle_multiprong(world, available, spent, target_locked, moves, mode_log)
 
+    if not _over_budget():
+        handle_enemy_assault(world, available, spent, target_locked, moves, mode_log)
+
     
     for p in world.my_planets:
         if mode_log.get(p.id) and "absorb" not in mode_log[p.id]:
@@ -4602,8 +4686,8 @@ def plan_moves(world, deadline=None):
 
 
 def handle_reinforce_min_garrison(world, available, spent, target_locked, moves, mode_log):
-    """Keep each friendly planet at least 5 ships by moving surplus from safe siblings."""
-    min_garrison = 5
+    """Keep each friendly planet at GARRISON_TARGET ships by moving surplus from safe siblings."""
+    min_garrison = GARRISON_TARGET
     for target in world.my_planets:
         cur = int(target.ships)
         if cur >= min_garrison:
@@ -4652,14 +4736,14 @@ def handle_reinforce_surplus(world, available, spent, target_locked, moves, mode
                if owner != world.player and owner != -1) > 0:
             continue
         avail = available[src.id] - spent[src.id]
-        if avail <= 5:
+        if avail <= GARRISON_TARGET:
             continue
-        send = avail - 5
+        send = avail - GARRISON_TARGET
         if send <= 0:
             continue
 
         low_targets = [p for p in world.my_planets
-                       if p.id != src.id and int(p.ships) < SURPLUS_TARGET_CAP]
+                       if p.id != src.id and int(p.ships) < GARRISON_TARGET]
         if not low_targets:
             continue
         low_targets.sort(key=lambda p: (int(p.ships), dist(src.x, src.y, p.x, p.y)))
@@ -4686,59 +4770,73 @@ def handle_reinforce_surplus(world, available, spent, target_locked, moves, mode
 
 
 def handle_home_reinforce(world, available, spent, target_locked, moves, mode_log):
-    """Move surplus ships back to home-sector planets if own planets drift too far."""
-    if not world.home_sector_defined:
+    """Return ships to home area when they drift too far from the initial home center.
+    Uses distance threshold: HOME_RETURN_DIST_2P for 2P, HOME_RETURN_DIST_4P for 4P.
+    Also tries to recapture non-friendly planets inside the home radius.
+    """
+    if world.home_center is None:
         return
-    home_planets = [p for p in world.my_planets if world.home_sector_contains(p)]
-    away_planets = [p for p in world.my_planets if not world.home_sector_contains(p)]
-    if not home_planets or not away_planets:
+    hx, hy = world.home_center
+    dist_limit = HOME_RETURN_DIST_2P if world.is_2p else HOME_RETURN_DIST_4P
+
+    away_planets = [p for p in world.my_planets
+                    if dist(p.x, p.y, hx, hy) > dist_limit]
+    if not away_planets:
         return
-    home_planets.sort(key=lambda p: world.home_distance(p))
+    home_planets = [p for p in world.my_planets
+                    if dist(p.x, p.y, hx, hy) <= dist_limit]
+
+    # Non-friendly planets inside our home radius (recapture priority)
     home_targets = [p for p in world.planets
-                    if p.owner != world.player and world.home_sector_contains(p)]
-    home_targets.sort(key=lambda p: dist(p.x, p.y, CENTER_X, CENTER_Y))
+                    if p.owner != world.player
+                    and dist(p.x, p.y, hx, hy) <= dist_limit]
+    home_targets.sort(key=lambda p: dist(p.x, p.y, hx, hy))
+
     for src in away_planets:
-        if src.id in mode_log and mode_log[src.id] != "reinforce-min-garrison":
+        if src.id in mode_log and mode_log[src.id] not in ("reinforce-min-garrison",):
             continue
         avail = available[src.id] - spent[src.id]
-        if avail <= 5 + 5:
+        if avail <= GARRISON_TARGET:
             continue
         if sum(int(ships) for eta, owner, ships in world.arrivals_by_planet.get(src.id, [])
                if owner != world.player and owner != -1) > 0:
             continue
-        max_send = min(5, avail - 5)
-        if max_send < 5:
-            continue
-        # First try to capture a non-friendly planet inside our home sector.
-        home_capture = None
+        send = avail - GARRISON_TARGET
+
+        # First try to recapture a non-friendly planet inside home area
+        captured = False
         for tgt in home_targets:
-            if tgt.id == src.id or tgt.id in target_locked:
+            if tgt.id in target_locked:
                 continue
             if not is_targetable(world, tgt):
                 continue
-            plan = plan_solo_capture(world, src, tgt, max_send, max_travel=40)
+            plan = plan_solo_capture(world, src, tgt, send, max_travel=SEGMENT_MAX_TURNS)
             if plan is None:
                 continue
             angle, turns, ships = plan
-            home_capture = (tgt, angle, turns, ships)
-            break
-        if home_capture is not None:
-            tgt, angle, turns, ships = home_capture
             _commit_fleet(world, moves, spent, target_locked,
                           src.id, tgt.id, angle, turns, int(ships))
-            mode_log[src.id] = "home-capture"
-            mode_log[tgt.id] = "home-captured"
+            mode_log[src.id] = "home-recapture"
+            mode_log[tgt.id] = "home-recaptured"
+            captured = True
+            break
+        if captured:
+            continue
+
+        # Send surplus toward the closest home planet
+        if not home_planets:
             continue
         target = min(home_planets, key=lambda p: dist(src.x, src.y, p.x, p.y))
         if target.id == src.id:
             continue
-        ships = max_send
-        aim = aim_at_target(src, target, ships, world.initial_by_id, world.ang_vel, world=world)
+        aim = aim_at_target(src, target, send, world.initial_by_id, world.ang_vel, world=world)
         if aim is None:
             continue
         angle, turns = aim
+        if turns > SEGMENT_MAX_TURNS:
+            continue
         _commit_fleet(world, moves, spent, target_locked,
-                      src.id, target.id, angle, turns, int(ships))
+                      src.id, target.id, angle, turns, int(send))
         mode_log[src.id] = "home-reinforce"
         mode_log[target.id] = "home-receive"
 
