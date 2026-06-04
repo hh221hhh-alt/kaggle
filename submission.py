@@ -136,7 +136,7 @@ AIM_CONVERGE_TURNS = 1
 ATTACK_MAX_SHIPS = 20          # non-collector attack cap
 
 COMET_EVAC_REMAINING_TURNS = 8
-COMET_EVAC_MIN_SHIPS = 5
+COMET_EVAC_MIN_SHIPS = MIN_DISPATCH_SHIPS
 
 DOOM_EVAC_ENABLED = True
 DOOM_EVAC_MIN_SHIPS = 5
@@ -166,7 +166,7 @@ HOME_RETURN_DIST_4P = 22.0     # send ships home if farther than this (4P)
 ENEMY_ASSAULT_RATIO = 1.5      # launch all-out attack when we have this multiple of enemy garrison
 
 F3_THREE_BUCKET_ENABLED = True
-F3_SAFE_FLOOR = 5
+F3_SAFE_FLOOR = MIN_DISPATCH_SHIPS
 F3_SAFE_DIST = 12.0
 F3_HARD_FLOOR = 14
 F3_HARD_GARRISON = 14
@@ -2573,9 +2573,24 @@ def friendly_already_committed(world, target_id):
 
 def _commit_fleet(world, moves, spent, target_locked,
                   src_id, target_id, angle, turns, ships):
-    """Single point of truth for firing a fleet: appends move, charges spent,
-    locks target this turn, and records the persistent commitment so future
-    turns know we already engaged this target."""
+    """Single point of truth for firing a fleet.
+    Hard rules enforced here regardless of caller:
+    - Minimum MIN_DISPATCH_SHIPS ships
+    - Enemy/neutral targets must be in approaching direction (not chasing)
+    - Turn limit SEGMENT_MAX_TURNS for enemy/neutral targets
+    """
+    if int(ships) < MIN_DISPATCH_SHIPS:
+        return
+    tgt_obj = world.planet_by_id.get(int(target_id))
+    if tgt_obj is not None and tgt_obj.owner != world.player:
+        if int(turns) > SEGMENT_MAX_TURNS:
+            return
+        src_obj = world.planet_by_id.get(int(src_id))
+        if src_obj is not None:
+            pred_x, pred_y = predict_target_position(tgt_obj, world, int(turns))
+            if not is_in_approaching_direction(src_obj, tgt_obj, world.ang_vel,
+                                               tx=pred_x, ty=pred_y):
+                return
     moves.append([src_id, float(angle), int(ships)])
     spent[src_id] += int(ships)
     target_locked.add(target_id)
