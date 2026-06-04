@@ -3763,7 +3763,8 @@ def _try_coalition_expand(world, src, tgt, max_travel, available, spent,
         avail = available[p.id] - spent[p.id]
         if avail < COALITION_MIN_PER_CONTRIBUTOR:
             continue
-        
+        if not is_in_approaching_direction(p, tgt, world.ang_vel):
+            continue
         est = aim_at_target(p, tgt, avail, world.initial_by_id, world.ang_vel, world=world)
         if est is None:
             continue
@@ -4081,6 +4082,8 @@ def handle_mega_hammer(world, available, spent, target_locked, moves, mode_log):
                 continue
             if int(tgt.ships) > MEGA_HAMMER_TARGET_GARRISON_MAX_ITER_H:
                 continue
+            if not is_in_approaching_direction(src, tgt, world.ang_vel):
+                continue
             aim = aim_at_target(src, tgt, avail, world.initial_by_id,
                                 world.ang_vel, world=world)
             if aim is None:
@@ -4264,9 +4267,11 @@ def _build_hammer_plan(world, available, spent):
 
     best = None
     for tgt in targets:
-        
+
         per_src = []
         for src, avail in stockpiles:
+            if not is_in_approaching_direction(src, tgt, world.ang_vel):
+                continue
             aim = aim_at_target(src, tgt, max(1, avail), world.initial_by_id, world.ang_vel, world=world)
             if aim is None:
                 continue
