@@ -748,16 +748,20 @@ def orbital_target_approaching(src, target, world):
 
 
 
-def is_in_approaching_direction(src, target, ang_vel):
+def is_in_approaching_direction(src, target, ang_vel, tx=None, ty=None):
     """Return True only if target is in the direction opposite to the board's rotation flow.
     Clockwise rotation (ang_vel < 0) → only shoot counter-clockwise (delta > 0).
     Counter-clockwise rotation (ang_vel > 0) → only shoot clockwise (delta < 0).
     No rotation → allow any direction.
+    tx, ty: optional predicted target position override (for ideas 1+7).
     """
     if abs(ang_vel) < 1e-9:
         return True
     src_angle = math.atan2(src.y - CENTER_Y, src.x - CENTER_X)
-    tgt_angle = math.atan2(target.y - CENTER_Y, target.x - CENTER_X)
+    tgt_angle = math.atan2(
+        (ty if ty is not None else target.y) - CENTER_Y,
+        (tx if tx is not None else target.x) - CENTER_X,
+    )
     delta = tgt_angle - src_angle
     while delta > math.pi:
         delta -= 2 * math.pi
@@ -2612,8 +2616,6 @@ def plan_solo_capture(world, src, tgt, max_avail, max_travel):
         min_floor = 5 if (world.is_2p and raw_dist < 12.0) else MIN_DISPATCH_SHIPS
     if max_avail < min_floor:
         return None
-    if not is_in_approaching_direction(src, tgt, world.ang_vel):
-        return None
     aim = aim_at_target(src, tgt, max_avail, world.initial_by_id, world.ang_vel, world=world)
     if aim is None:
         return None
@@ -2621,6 +2623,10 @@ def plan_solo_capture(world, src, tgt, max_avail, max_travel):
     if turns > SEGMENT_MAX_TURNS:
         return None
     if turns > max_travel:
+        return None
+    # Ideas 1+7: check direction using predicted target position at arrival time
+    pred_x, pred_y = predict_target_position(tgt, world, int(turns))
+    if not is_in_approaching_direction(src, tgt, world.ang_vel, tx=pred_x, ty=pred_y):
         return None
     need = effective_needed_to_capture(tgt, turns, world)  
     margin = EXPAND_MIN_MARGIN_4P if not world.is_2p else EXPAND_MIN_MARGIN
@@ -3648,14 +3654,20 @@ def _nearest_targets(src, world, K, max_travel, target_locked):
         
         if R1_RECAPTURE_PRIORITY_ENABLED and t.id in _freshly_lost_planets:
             weighted -= R1_RECAPTURE_HAMMER_BONUS * 1.5
-        
+
+        # Idea 6: strongly prioritize neutrals the enemy is about to capture
+        if t.owner == -1 and RACE_ENABLED:
+            enemy_eta = world.enemy_race_eta.get(t.id)
+            if enemy_eta is not None and enemy_eta <= 5:
+                weighted -= 15.0  # urgent: enemy is very close
+
         if not world.home_sector_defined:
             home_penalty = 0.0
         else:
             home_penalty = world.home_penalty(t)
         if home_penalty > 0:
             weighted += home_penalty
-        
+
         candidates.append((t, weighted, raw))
     if not candidates:
         return []
@@ -4684,12 +4696,24 @@ def handle_collector_fleets(world, available, spent, target_locked, moves, mode_
             _collector_positions[q] = circuit[0]
             continue
 
-        # --- Priority 3: pass surplus to next planet in circuit (snowball) ---
-        idx = circuit.index(cur_id) if cur_id in circuit else 0
-        next_id = circuit[(idx + 1) % len(circuit)]
-        if next_id == cur_id:
+        # --- Priority 3: pass surplus to next planet dynamically (idea 2) ---
+        # Pick the planet in this quadrant with the most surplus as the next stop
+        candidates = [
+            p for p in planets
+            if p.id != cur_id
+            and (available[p.id] - spent[p.id]) > GARRISON_TARGET
+        ]
+        if candidates:
+            next_planet = max(candidates,
+                              key=lambda p: available[p.id] - spent[p.id] - GARRISON_TARGET)
+        else:
+            # Fall back to next in circuit order
+            idx = circuit.index(cur_id) if cur_id in circuit else 0
+            next_id = circuit[(idx + 1) % len(circuit)]
+            next_planet = world.planet_by_id.get(next_id)
+        if next_planet is None or next_planet.id == cur_id:
             continue
-        next_planet = world.planet_by_id.get(next_id)
+        next_id = next_planet.id
         if next_planet is None:
             continue
         aim = aim_at_target(cur_planet, next_planet, surplus, world.initial_by_id,
@@ -4707,6 +4731,157 @@ def handle_collector_fleets(world, available, spent, target_locked, moves, mode_
         mode_log[cur_id] = "collector-snowball"
         # Advance collector position to the next planet
         _collector_positions[q] = next_id
+
+
+def handle_intercept(world, available, spent, target_locked, moves, mode_log):
+    """Idea 3: when an enemy fleet is heading to one of our planets, attack the
+    source planet while its garrison is thin (they just launched from there).
+    """
+    attacked = set()
+    for pid, arrivals in world.arrivals_by_planet.items():
+        p = world.planet_by_id.get(pid)
+        if p is None or p.owner != world.player:
+            continue
+        for _eta, owner, ships in arrivals:
+            if owner == world.player or owner == -1 or ships <= 0:
+                continue
+            # Find the enemy fleet(s) heading here and their source planet
+            for f in world.fleets:
+                if f.owner != owner:
+                    continue
+                src_planet = world.planet_by_id.get(int(f.from_planet_id))
+                if src_planet is None or src_planet.owner != owner:
+                    continue
+                if src_planet.id in attacked or src_planet.id in target_locked:
+                    continue
+                # Attack the weakened source planet from our nearest planet
+                for my_p in sorted(world.my_planets,
+                                   key=lambda mp: dist(mp.x, mp.y, src_planet.x, src_planet.y)):
+                    avail = available[my_p.id] - spent[my_p.id]
+                    need = int(src_planet.ships) + 1
+                    if avail < need:
+                        continue
+                    if not is_in_approaching_direction(my_p, src_planet, world.ang_vel):
+                        continue
+                    aim = aim_at_target(my_p, src_planet, avail, world.initial_by_id,
+                                        world.ang_vel, world=world)
+                    if aim is None:
+                        continue
+                    angle, turns = aim
+                    if turns > SEGMENT_MAX_TURNS:
+                        continue
+                    _commit_fleet(world, moves, spent, target_locked,
+                                  my_p.id, src_planet.id, angle, turns, int(avail))
+                    mode_log[my_p.id] = "intercept"
+                    mode_log[src_planet.id] = "intercept-target"
+                    attacked.add(src_planet.id)
+                    break
+
+
+def handle_frontier_reinforce(world, available, spent, target_locked, moves, mode_log):
+    """Idea 5: concentrate surplus ships at our frontier planets (closest to enemies).
+    Sends from safe backline planets to frontier planets.
+    """
+    if not world.enemy_planets:
+        return
+    # Mark frontier: our planets within 35 units of any enemy planet
+    FRONTIER_DIST = 35.0
+    frontier = [p for p in world.my_planets
+                if min(dist(p.x, p.y, e.x, e.y) for e in world.enemy_planets) <= FRONTIER_DIST]
+    backline = [p for p in world.my_planets
+                if min(dist(p.x, p.y, e.x, e.y) for e in world.enemy_planets) > FRONTIER_DIST]
+    if not frontier or not backline:
+        return
+    for src in backline:
+        if mode_log.get(src.id):
+            continue
+        avail = available[src.id] - spent[src.id]
+        if avail <= GARRISON_TARGET:
+            continue
+        send = avail - GARRISON_TARGET
+        # Find nearest frontier planet that can accept ships
+        dst = min(frontier, key=lambda p: dist(src.x, src.y, p.x, p.y))
+        aim = aim_at_target(src, dst, send, world.initial_by_id,
+                            world.ang_vel, world=world)
+        if aim is None:
+            continue
+        angle, turns = aim
+        if turns > SEGMENT_MAX_TURNS:
+            continue
+        _commit_fleet(world, moves, spent, target_locked,
+                      src.id, dst.id, angle, turns, int(send))
+        mode_log[src.id] = "frontier-reinforce"
+        mode_log[dst.id] = "frontier-receiver"
+
+
+def handle_opportunistic_attack(world, available, spent, target_locked, moves, mode_log):
+    """Idea 8: attack enemy planets immediately after they launched a fleet
+    (garrison is temporarily thin). Uses _enemy_recently_launched tracking.
+    """
+    if not _enemy_recently_launched:
+        return
+    for tgt_id in list(_enemy_recently_launched):
+        if tgt_id in target_locked:
+            continue
+        tgt = world.planet_by_id.get(tgt_id)
+        if tgt is None or tgt.owner == world.player or tgt.owner == -1:
+            continue
+        for src in sorted(world.my_planets,
+                          key=lambda p: dist(p.x, p.y, tgt.x, tgt.y)):
+            if mode_log.get(src.id):
+                continue
+            avail = available[src.id] - spent[src.id]
+            need = int(tgt.ships) + 1
+            if avail < need:
+                continue
+            if not is_in_approaching_direction(src, tgt, world.ang_vel):
+                continue
+            aim = aim_at_target(src, tgt, avail, world.initial_by_id,
+                                world.ang_vel, world=world)
+            if aim is None:
+                continue
+            angle, turns = aim
+            if turns > SEGMENT_MAX_TURNS:
+                continue
+            _commit_fleet(world, moves, spent, target_locked,
+                          src.id, tgt.id, angle, turns, int(avail))
+            mode_log[src.id] = "opportunistic-attack"
+            mode_log[tgt.id] = "opportunistic-target"
+            break
+
+
+def handle_waypoint_capture(world, available, spent, target_locked, moves, mode_log):
+    """Idea 9: capture neutral planets that lie between us and enemy territory
+    as stepping stones / bridgeheads for future attacks.
+    """
+    if not world.enemy_planets or not world.neutral_planets:
+        return
+    for src in world.my_planets:
+        if mode_log.get(src.id):
+            continue
+        avail = available[src.id] - spent[src.id]
+        if avail < MIN_DISPATCH_SHIPS:
+            continue
+        nearest_enemy = min(world.enemy_planets,
+                            key=lambda e: dist(src.x, src.y, e.x, e.y))
+        our_dist = dist(src.x, src.y, nearest_enemy.x, nearest_enemy.y)
+        # Neutrals closer to the enemy than we are (between us and enemy)
+        waypoints = [
+            n for n in world.neutral_planets
+            if n.id not in target_locked
+            and not _neutral_blocked_by_cap(world, n)
+            and dist(n.x, n.y, nearest_enemy.x, nearest_enemy.y) < our_dist
+            and is_in_approaching_direction(src, n, world.ang_vel)
+        ]
+        for n in sorted(waypoints, key=lambda p: dist(src.x, src.y, p.x, p.y)):
+            plan = plan_solo_capture(world, src, n, avail, SEGMENT_MAX_TURNS)
+            if plan is None:
+                continue
+            angle, turns, ships = plan
+            _commit_fleet(world, moves, spent, target_locked,
+                          src.id, n.id, angle, turns, int(ships))
+            mode_log[src.id] = "waypoint-capture"
+            break
 
 
 def handle_enemy_assault(world, available, spent, target_locked, moves, mode_log):
@@ -4850,6 +5025,18 @@ def plan_moves(world, deadline=None):
     
     if not _over_budget():
         handle_multiprong(world, available, spent, target_locked, moves, mode_log)
+
+    if not _over_budget():
+        handle_intercept(world, available, spent, target_locked, moves, mode_log)
+
+    if not _over_budget():
+        handle_opportunistic_attack(world, available, spent, target_locked, moves, mode_log)
+
+    if not _over_budget():
+        handle_frontier_reinforce(world, available, spent, target_locked, moves, mode_log)
+
+    if not _over_budget():
+        handle_waypoint_capture(world, available, spent, target_locked, moves, mode_log)
 
     if not _over_budget():
         handle_collector_fleets(world, available, spent, target_locked, moves, mode_log)
