@@ -704,16 +704,6 @@ def orbital_target_approaching(src, target, world):
         return True
     if dist(init.x, init.y, CENTER_X, CENTER_Y) + init.radius >= ROTATION_LIMIT:
         return True
-
-
-def estimate_arrival(sx, sy, sr, tx, ty, tr, ships):
-    safe = safe_geometry(sx, sy, sr, tx, ty, tr)
-    if safe is None:
-        return None
-    angle, total_d = safe
-    turns = max(1, int(math.ceil(total_d / fleet_speed(max(1, ships)))))
-    return angle, turns
-
     cur_angle = math.atan2(target.y - CENTER_Y, target.x - CENTER_X)
     next_angle = cur_angle + world.ang_vel
     r = dist(init.x, init.y, CENTER_X, CENTER_Y)
