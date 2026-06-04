@@ -139,8 +139,8 @@ COMET_EVAC_REMAINING_TURNS = 8
 COMET_EVAC_MIN_SHIPS = MIN_DISPATCH_SHIPS
 
 DOOM_EVAC_ENABLED = True
-DOOM_EVAC_MIN_SHIPS = 5
-DOOM_EVAC_MAX_TRAVEL = 20
+DOOM_EVAC_MIN_SHIPS = MIN_DISPATCH_SHIPS
+DOOM_EVAC_MAX_TRAVEL = SEGMENT_MAX_TURNS
 DOOM_EVAC_ATTACK_FALLBACK_ENABLED = True
 DOOM_EVAC_ATTACK_FALLBACK_4P_ONLY = False
 DOOM_EVAC_ATTACK_OVERKILL = 2
@@ -2633,7 +2633,7 @@ def plan_solo_capture(world, src, tgt, max_avail, max_travel):
         else:
             min_floor = MIN_DISPATCH_SHIPS
     else:
-        min_floor = 5 if (world.is_2p and raw_dist < 12.0) else MIN_DISPATCH_SHIPS
+        min_floor = MIN_DISPATCH_SHIPS
     if max_avail < min_floor:
         return None
     aim = aim_at_target(src, tgt, max_avail, world.initial_by_id, world.ang_vel,
@@ -2964,6 +2964,8 @@ def _find_defense_coalition(world, victim, deadline, need, available, spent):
         if aim is None:
             continue
         _angle_est, turns = aim
+        if turns > SEGMENT_MAX_TURNS:
+            continue
         if deadline is not None and turns > deadline:
             continue
         options.append((turns, src.id, src, avail))
