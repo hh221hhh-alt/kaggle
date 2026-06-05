@@ -4365,9 +4365,22 @@ def _get_quadrant_from_pos(x, y):
     return x_half * 2 + y_half
 
 
+def _wall_dist_in_quadrant(p):
+    """Distance from the nearest quadrant boundary wall."""
+    q = _get_quadrant(p)
+    if q == 0:   # NW: x<50, y<50
+        return min(p.x, CENTER_X - p.x, p.y, CENTER_Y - p.y)
+    elif q == 1: # SW: x<50, y>=50
+        return min(p.x, CENTER_X - p.x, p.y - CENTER_Y, BOARD - p.y)
+    elif q == 2: # NE: x>=50, y<50
+        return min(p.x - CENTER_X, BOARD - p.x, p.y, CENTER_Y - p.y)
+    else:        # SE: x>=50, y>=50
+        return min(p.x - CENTER_X, BOARD - p.x, p.y - CENTER_Y, BOARD - p.y)
+
+
 def _select_parents(world):
-    """Select 2 parent planets per occupied quadrant.
-    Prefer static planets. Pick the pair that is furthest apart.
+    """Select up to 2 parent planets per occupied quadrant.
+    Static planets only. Pick the 2 most central (furthest from quadrant walls).
     """
     quadrants = defaultdict(list)
     for p in world.my_planets:
@@ -4375,26 +4388,11 @@ def _select_parents(world):
 
     parents = []
     for q, planets in quadrants.items():
-        # Static planets only
-        candidates = [p for p in planets if is_static_planet(p)]
-
-        if len(candidates) == 0:
-            continue
-        elif len(candidates) == 1:
-            parents.append(candidates[0])
-        else:
-            # Pick the pair with maximum distance between them
-            best_pair = (candidates[0], candidates[1])
-            best_d = dist(candidates[0].x, candidates[0].y,
-                         candidates[1].x, candidates[1].y)
-            for i in range(len(candidates)):
-                for j in range(i + 1, len(candidates)):
-                    d = dist(candidates[i].x, candidates[i].y,
-                             candidates[j].x, candidates[j].y)
-                    if d > best_d:
-                        best_d = d
-                        best_pair = (candidates[i], candidates[j])
-            parents.extend(best_pair)
+        candidates = sorted(
+            [p for p in planets if is_static_planet(p)],
+            key=lambda p: -_wall_dist_in_quadrant(p)  # most central first
+        )
+        parents.extend(candidates[:2])
     return parents
 
 
@@ -4443,7 +4441,10 @@ def handle_parent_evac(world, available, spent, target_locked, moves, mode_log):
 
 
 def handle_parent_collect(world, available, spent, target_locked, moves, mode_log):
-    """Non-parent planets send surplus (>20) to the nearest available parent."""
+    """Non-parent planets send surplus (>20) toward parents via relay.
+    Relay = nearest friendly planet that is closer to the parent than the source.
+    This creates a cascade chain that batches ships as they flow.
+    """
     if not PARENT_ENABLED:
         return
     parents = _select_parents(world)
@@ -4462,21 +4463,43 @@ def handle_parent_collect(world, available, spent, target_locked, moves, mode_lo
             continue
         surplus = avail - GARRISON_TARGET
 
-        # Find nearest parent not already receiving this turn
-        for dst in sorted(parents, key=lambda p: dist(src.x, src.y, p.x, p.y)):
-            if dst.id in target_locked:
-                continue
-            aim = aim_at_target(src, dst, surplus, world.initial_by_id,
+        # Find nearest parent to target
+        target_parent = min(parents, key=lambda p: dist(src.x, src.y, p.x, p.y))
+        parent_dist = dist(src.x, src.y, target_parent.x, target_parent.y)
+
+        # Try relay: nearest friendly planet that is closer to parent than src
+        relay = None
+        relay_candidates = sorted(
+            [p for p in world.my_planets
+             if p.id != src.id
+             and p.id not in target_locked
+             and dist(p.x, p.y, target_parent.x, target_parent.y) < parent_dist],
+            key=lambda p: dist(src.x, src.y, p.x, p.y)
+        )
+        for rp in relay_candidates:
+            aim = aim_at_target(src, rp, surplus, world.initial_by_id,
                                 world.ang_vel, world=world)
             if aim is None:
                 continue
-            angle, turns = aim
-            if turns > SEGMENT_MAX_TURNS:
-                continue
-            _commit_fleet(world, moves, spent, target_locked,
-                          src.id, dst.id, angle, turns, int(surplus))
-            mode_log[src.id] = "to-parent"
-            break
+            _, turns = aim
+            if turns <= SEGMENT_MAX_TURNS:
+                relay = rp
+                break
+
+        # Fall back to direct parent if no relay
+        dst = relay if relay is not None else target_parent
+        if dst.id in target_locked:
+            continue
+        aim = aim_at_target(src, dst, surplus, world.initial_by_id,
+                            world.ang_vel, world=world)
+        if aim is None:
+            continue
+        angle, turns = aim
+        if turns > SEGMENT_MAX_TURNS:
+            continue
+        _commit_fleet(world, moves, spent, target_locked,
+                      src.id, dst.id, angle, turns, int(surplus))
+        mode_log[src.id] = "to-parent"
 
 
 def handle_parent_attack(world, available, spent, target_locked, moves, mode_log):
@@ -4496,56 +4519,78 @@ def handle_parent_attack(world, available, spent, target_locked, moves, mode_log
         if avail <= GARRISON_TARGET:
             continue
 
-        # Find best target
-        candidates = sorted(
-            [p for p in world.planets
-             if p.owner != world.player
-             and p.id not in target_locked
-             and is_targetable(world, p)],
-            key=lambda p: -_score_target(parent, p, world)
-        )
+        # Attackable targets: can we win right now?
+        all_targets = [p for p in world.planets
+                       if p.owner != world.player
+                       and p.id not in target_locked
+                       and is_targetable(world, p)
+                       and not friendly_already_committed(world, p.id)]
+
+        # Sort: nearby attackable first, then by score
+        attackable = [t for t in all_targets if int(t.ships) + 1 <= avail - GARRISON_TARGET]
+        attackable.sort(key=lambda p: -_score_target(parent, p, world))
 
         attacked = False
-        for tgt in candidates:
-            if friendly_already_committed(world, tgt.id):
-                continue
+        for tgt in attackable:
             need = int(tgt.ships) + 1
-            if avail < need + GARRISON_TARGET:
-                # Not enough ships — send surplus to another parent to pool
-                surplus = avail - GARRISON_TARGET
-                if surplus < MIN_DISPATCH_SHIPS:
-                    continue
-                other_parents = [p for p in parents
-                                 if p.id != parent.id
-                                 and p.id not in target_locked
-                                 and not mode_log.get(p.id)]
-                if not other_parents:
-                    continue
-                dst = min(other_parents,
-                          key=lambda p: dist(parent.x, parent.y, p.x, p.y))
-                aim = aim_at_target(parent, dst, surplus, world.initial_by_id,
+            aim = aim_at_target(parent, tgt, need, world.initial_by_id,
+                                world.ang_vel, world=world, check_approach=True)
+            if aim is None:
+                continue
+            angle, turns = aim
+            _commit_fleet(world, moves, spent, target_locked,
+                          parent.id, tgt.id, angle, turns, int(need))
+            mode_log[parent.id] = "parent-attack"
+            attacked = True
+            break
+
+        if attacked:
+            continue
+
+        surplus = avail - GARRISON_TARGET
+        if surplus < MIN_DISPATCH_SHIPS:
+            continue
+
+        # Can't attack: try pooling with another parent
+        other_parents = [p for p in parents
+                         if p.id != parent.id
+                         and p.id not in target_locked
+                         and not mode_log.get(p.id)]
+        pooled = False
+        for dst in sorted(other_parents,
+                          key=lambda p: dist(parent.x, parent.y, p.x, p.y)):
+            aim = aim_at_target(parent, dst, surplus, world.initial_by_id,
+                                world.ang_vel, world=world)
+            if aim is None:
+                continue
+            angle, turns = aim
+            if turns > SEGMENT_MAX_TURNS:
+                continue
+            _commit_fleet(world, moves, spent, target_locked,
+                          parent.id, dst.id, angle, turns, int(surplus))
+            mode_log[parent.id] = "parent-pool"
+            pooled = True
+            break
+
+        if not pooled:
+            # No target, no pool partner: send surplus to frontier
+            frontier_q = _frontier_quadrant(_get_quadrant(parent), world.ang_vel)
+            frontier_planets = sorted(
+                [p for p in world.my_planets
+                 if _get_quadrant(p) == frontier_q and p.id not in target_locked],
+                key=lambda p: dist(parent.x, parent.y, p.x, p.y)
+            )
+            for fp in frontier_planets:
+                aim = aim_at_target(parent, fp, surplus, world.initial_by_id,
                                     world.ang_vel, world=world)
                 if aim is None:
                     continue
                 angle, turns = aim
-                if turns > SEGMENT_MAX_TURNS:
-                    continue
-                _commit_fleet(world, moves, spent, target_locked,
-                              parent.id, dst.id, angle, turns, int(surplus))
-                mode_log[parent.id] = "parent-pool"
-                attacked = True
-                break
-            else:
-                aim = aim_at_target(parent, tgt, need, world.initial_by_id,
-                                    world.ang_vel, world=world, check_approach=True)
-                if aim is None:
-                    continue
-                angle, turns = aim
-                _commit_fleet(world, moves, spent, target_locked,
-                              parent.id, tgt.id, angle, turns, int(need))
-                mode_log[parent.id] = "parent-attack"
-                attacked = True
-                break
+                if turns <= SEGMENT_MAX_TURNS * 2:
+                    _commit_fleet(world, moves, spent, target_locked,
+                                  parent.id, fp.id, angle, turns, int(surplus))
+                    mode_log[parent.id] = "parent-to-frontier"
+                    break
 
 
 def handle_enemy_assault(world, available, spent, target_locked, moves, mode_log):
