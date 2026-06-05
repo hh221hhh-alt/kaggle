@@ -4128,10 +4128,9 @@ def handle_home_attack(world, available, spent, target_locked, moves, mode_log):
 
 
 def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
-    """Fire exactly GARRISON_TARGET (10) ships when surplus >= 10.
-    Restricts to home zone targets when home zone is not yet cleared.
+    """Fire when garrison > 20, send exactly what's needed (10-20 ships).
+    In opening, prioritize nearby planets to form a cluster.
     """
-    send = GARRISON_TARGET
     home_clear = _home_zone_clear(world)
     hx = hy = None
     dist_limit = None
@@ -4143,20 +4142,26 @@ def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
         if mode_log.get(src.id):
             continue
         avail = available[src.id] - spent[src.id]
-        # Fire as soon as any surplus exists above GARRISON_TARGET
-        if avail <= GARRISON_TARGET:
+        if avail <= GARRISON_TARGET * 2:  # fire when > 20
             continue
-        targets = sorted(
+
+        # Find capturable targets (garrison <= ATTACK_MAX_SHIPS - 1 = 19)
+        candidates = sorted(
             [p for p in world.planets
              if p.owner != world.player
              and p.id not in target_locked
              and is_targetable(world, p)
-             and int(p.ships) < send
+             and int(p.ships) < ATTACK_MAX_SHIPS
              and (home_clear or (hx is not None and dist(p.x, p.y, hx, hy) <= dist_limit))],
-            # Distance first; prefer higher production among nearby targets
+            # Opening: distance first (cluster formation); otherwise production first
             key=lambda p: (dist(src.x, src.y, p.x, p.y), -int(p.production))
+            if world.is_opening else
+            (-int(p.production), dist(src.x, src.y, p.x, p.y))
         )
-        for tgt in targets:
+        for tgt in candidates:
+            send = max(MIN_DISPATCH_SHIPS, min(int(tgt.ships) + 1, ATTACK_MAX_SHIPS))
+            if avail < send + GARRISON_TARGET:
+                continue
             aim = aim_at_target(src, tgt, send, world.initial_by_id,
                                 world.ang_vel, world=world, check_approach=True)
             if aim is None:
