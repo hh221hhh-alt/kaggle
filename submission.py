@@ -167,7 +167,7 @@ HOME_RETURN_DIST_2P = 35.0     # send ships home if farther than this (2P)
 HOME_RETURN_DIST_4P = 22.0     # send ships home if farther than this (4P)
 ENEMY_ASSAULT_RATIO = 1.5      # launch all-out attack when we have this multiple of enemy garrison
 OCCUPIED_THRESHOLD = 0.8       # 80% of planets owned = "occupied territory"
-OCCUPIED_TURN = 100            # activate occupied distribution after this turn
+OCCUPIED_TURN = 50             # activate occupied distribution after this turn
 # Opposite quadrant map: SE↔NW, NE↔SW
 _OPPOSITE_Q = {3: 0, 0: 3, 2: 1, 1: 2}
 
