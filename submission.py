@@ -2005,6 +2005,7 @@ def _record_2p_progress(my_prod_share, intended_patient, reset=False):
 
 _agent_step = 0
 _game_num_players = None
+_starting_max_prod = None   # max production of starting planets (set at step 0)
 _2p_patient_streak = 0
 _2p_prod_share_history = []
 
@@ -3899,8 +3900,13 @@ def handle_collector_fleets(world, available, spent, target_locked, moves, mode_
         if not planets:
             continue
 
-        # Active collector = planet with most available ships in this quadrant
-        collector = max(planets, key=lambda p: available[p.id] - spent[p.id])
+        # Only consider planets with 100+ ships for collection
+        rich_planets = [p for p in planets if int(p.ships) >= 100]
+        if not rich_planets:
+            continue
+
+        # Active collector = planet with most available ships among rich planets
+        collector = max(rich_planets, key=lambda p: available[p.id] - spent[p.id])
         pid = collector.id
 
         if mode_log.get(pid):
@@ -4240,16 +4246,21 @@ def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
         dist_limit = HOME_RETURN_DIST_2P if world.is_2p else HOME_RETURN_DIST_4P
 
     is_early = world.step < EARLY_GAME_TURNS
+    # Low-prod start: fire immediately with any ships if starting prod <= 3
+    low_prod_start = (_starting_max_prod is not None and _starting_max_prod <= 3)
 
     for src in world.my_planets:
         if mode_log.get(src.id):
             continue
         avail = available[src.id] - spent[src.id]
-        if is_early:
-            if avail <= EARLY_MIN_SHIPS:  # fire when > 5 in early game
+        if low_prod_start and is_early:
+            if avail <= 0:  # fire with any ship immediately
+                continue
+        elif is_early:
+            if avail <= EARLY_MIN_SHIPS:  # fire when > 5
                 continue
         else:
-            if avail <= GARRISON_TARGET * 2:  # fire when > 20 in mid/late game
+            if avail <= GARRISON_TARGET * 2:  # fire when > 20
                 continue
 
         # Find capturable targets (garrison <= ATTACK_MAX_SHIPS - 1 = 19)
@@ -4371,10 +4382,6 @@ def plan_moves(world, deadline=None):
     handle_comet_evac(world, available, spent, target_locked, moves, mode_log)
     handle_defense(world, rescue_needs, available, spent, target_locked, moves, mode_log)
 
-    # After turn 60: collector is top priority (runs right after defense)
-    if world.step >= 60 and not _over_budget():
-        handle_collector_fleets(world, available, spent, target_locked, moves, mode_log)
-
     if not _over_budget():
         handle_home_sweep(world, available, spent, target_locked, moves, mode_log)
     if not _over_budget():
@@ -4383,8 +4390,7 @@ def plan_moves(world, deadline=None):
         handle_home_reinforce(world, available, spent, target_locked, moves, mode_log)
     if not _over_budget():
         handle_reinforce_surplus(world, available, spent, target_locked, moves, mode_log)
-    # Before turn 60: collector runs here (before steady_fire)
-    if world.step < 60 and not _over_budget():
+    if not _over_budget():
         handle_collector_fleets(world, available, spent, target_locked, moves, mode_log)
     if not _over_budget():
         handle_steady_fire(world, available, spent, target_locked, moves, mode_log)
@@ -4500,12 +4506,13 @@ def agent(obs, config=None):
     global _agent_step, _pending_commitments
     global _game_num_players, _2p_patient_streak, _2p_prod_share_history
 
-    global _opp_profile  
+    global _opp_profile, _starting_max_prod
     obs_step = _read(obs, "step", 0) or 0
     if obs_step == 0:
         _agent_step = 0
         _pending_commitments = []
         _game_num_players = None
+        _starting_max_prod = None
         _2p_patient_streak = 0
         _2p_prod_share_history = []
         _neutral_prev_ships.clear()
@@ -4521,6 +4528,10 @@ def agent(obs, config=None):
     world = World(obs, inferred_step=_agent_step - 1)
     if not world.my_planets:
         return []
+
+    # Record max production of starting planets at step 0
+    if obs_step == 0 and _starting_max_prod is None:
+        _starting_max_prod = max((int(p.production) for p in world.my_planets), default=1)
 
     
     if not world.is_2p:
