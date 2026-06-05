@@ -4068,7 +4068,10 @@ def handle_flow_to_frontier(world, available, spent, target_locked, moves, mode_
     """All planets with surplus >20 send toward the frontier quadrant via relay.
     Each relay planet only receives from ONE source per turn (target_locked check).
     Planets sorted by most surplus first to prioritize big stockpiles.
+    Disabled before PARENT_START_TURN — early game focuses on expansion only.
     """
+    if world.step < PARENT_START_TURN:
+        return
     for src in sorted(world.my_planets,
                       key=lambda p: -(available[p.id] - spent[p.id])):
         if mode_log.get(src.id):
@@ -4861,17 +4864,20 @@ def handle_home_reinforce(world, available, spent, target_locked, moves, mode_lo
         avail = available[src.id] - spent[src.id]
         if avail <= 0:
             continue
-        # Prefer sending to nearest parent, fall back to nearest home planet
+        # Send to a FIXED anchor (parent, else most-central static, else most
+        # central) so two adjacent planets don't pick each other and ping-pong.
         dst_candidates = sorted(
-            [p for p in home_planets if p.id not in target_locked],
-            key=lambda p: (0 if p.id in parent_ids else 1,
-                           dist(src.x, src.y, p.x, p.y))
+            [p for p in home_planets
+             if p.id not in target_locked and p.id != src.id],
+            key=lambda p: (
+                0 if p.id in parent_ids else 1,        # parent first
+                0 if is_static_planet(p) else 1,        # static anchor next
+                -_wall_dist_in_quadrant(p),             # most central
+            )
         )
         if not dst_candidates:
             continue
         target = dst_candidates[0]
-        if target.id == src.id:
-            continue
         aim = aim_at_target(src, target, avail, world.initial_by_id,
                             world.ang_vel, world=world)
         if aim is None:
