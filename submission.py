@@ -3942,6 +3942,9 @@ def handle_collector_fleets(world, available, spent, target_locked, moves, mode_
         frontier_planets = [p for p in world.my_planets
                             if _get_quadrant(p) == frontier_q and p.id != pid]
 
+        # 300+ surplus or turn 60+: relax cascade limit
+        cascade_limit = SEGMENT_MAX_TURNS * 2 if (surplus >= 300 or world.step >= 60) else SEGMENT_MAX_TURNS
+
         next_planet = None
         # Try frontier planets first (sorted by distance)
         for fp in sorted(frontier_planets,
@@ -3951,7 +3954,7 @@ def handle_collector_fleets(world, available, spent, target_locked, moves, mode_
             if aim is None:
                 continue
             _, turns = aim
-            if turns <= SEGMENT_MAX_TURNS:
+            if turns <= cascade_limit:
                 next_planet = fp
                 break
 
@@ -3970,9 +3973,23 @@ def handle_collector_fleets(world, available, spent, target_locked, moves, mode_
                     if aim is None:
                         continue
                     _, turns = aim
-                    if turns <= SEGMENT_MAX_TURNS:
+                    if turns <= cascade_limit:
                         next_planet = np
                         break
+
+        # Last resort: find ANY reachable friendly planet (no turn limit)
+        if next_planet is None:
+            other_friendly = sorted(
+                [p for p in world.my_planets if p.id != pid],
+                key=lambda p: dist(collector.x, collector.y, p.x, p.y)
+            )
+            for fp in other_friendly:
+                aim = aim_at_target(collector, fp, surplus, world.initial_by_id,
+                                    world.ang_vel, world=world)
+                if aim is None:
+                    continue
+                next_planet = fp
+                break
 
         if next_planet is None:
             continue
@@ -4354,6 +4371,10 @@ def plan_moves(world, deadline=None):
     handle_comet_evac(world, available, spent, target_locked, moves, mode_log)
     handle_defense(world, rescue_needs, available, spent, target_locked, moves, mode_log)
 
+    # After turn 60: collector is top priority (runs right after defense)
+    if world.step >= 60 and not _over_budget():
+        handle_collector_fleets(world, available, spent, target_locked, moves, mode_log)
+
     if not _over_budget():
         handle_home_sweep(world, available, spent, target_locked, moves, mode_log)
     if not _over_budget():
@@ -4362,6 +4383,9 @@ def plan_moves(world, deadline=None):
         handle_home_reinforce(world, available, spent, target_locked, moves, mode_log)
     if not _over_budget():
         handle_reinforce_surplus(world, available, spent, target_locked, moves, mode_log)
+    # Before turn 60: collector runs here (before steady_fire)
+    if world.step < 60 and not _over_budget():
+        handle_collector_fleets(world, available, spent, target_locked, moves, mode_log)
     if not _over_budget():
         handle_steady_fire(world, available, spent, target_locked, moves, mode_log)
     if not _over_budget():
@@ -4374,8 +4398,6 @@ def plan_moves(world, deadline=None):
         handle_frontier_reinforce(world, available, spent, target_locked, moves, mode_log)
     if not _over_budget():
         handle_waypoint_capture(world, available, spent, target_locked, moves, mode_log)
-    if not _over_budget():
-        handle_collector_fleets(world, available, spent, target_locked, moves, mode_log)
     if not _over_budget():
         handle_enemy_assault(world, available, spent, target_locked, moves, mode_log)
 
