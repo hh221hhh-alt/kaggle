@@ -4246,17 +4246,12 @@ def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
         dist_limit = HOME_RETURN_DIST_2P if world.is_2p else HOME_RETURN_DIST_4P
 
     is_early = world.step < EARLY_GAME_TURNS
-    # Low-prod start: fire immediately with any ships if starting prod <= 3
-    low_prod_start = (_starting_max_prod is not None and _starting_max_prod <= 3)
 
     for src in world.my_planets:
         if mode_log.get(src.id):
             continue
         avail = available[src.id] - spent[src.id]
-        if low_prod_start and is_early:
-            if avail <= 0:  # fire with any ship immediately
-                continue
-        elif is_early:
+        if is_early:
             if avail <= EARLY_MIN_SHIPS:  # fire when > 5
                 continue
         else:
