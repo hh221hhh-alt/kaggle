@@ -2600,12 +2600,11 @@ def _commit_fleet(world, moves, spent, target_locked,
             return
         src_obj = world.planet_by_id.get(int(src_id))
         if src_obj is not None:
-            # Static planets nearby: skip direction check (idea 4)
-            d = dist(src_obj.x, src_obj.y, tgt_obj.x, tgt_obj.y)
+            # Static planets: no direction check (they don't move, no chasing issue)
             init = world.initial_by_id.get(tgt_obj.id)
             is_static = (init is not None and
                          dist(init.x, init.y, CENTER_X, CENTER_Y) + init.radius >= ROTATION_LIMIT)
-            if not (is_static and d < 20.0):
+            if not is_static:
                 if not is_in_approaching_direction(src_obj, tgt_obj, world.ang_vel):
                     return
     moves.append([src_id, float(angle), int(ships)])
@@ -4591,29 +4590,57 @@ def handle_parent_attack(world, available, spent, target_locked, moves, mode_log
             break
 
         if not pooled:
-            # No target, no pool: send to frontier of ALL occupied quadrants
-            all_frontier = []
-            occupied_qs = set(_get_quadrant(p) for p in world.my_planets)
-            for oq in occupied_qs:
-                fq = _frontier_quadrant(oq, world.ang_vel)
-                all_frontier.extend([
-                    p for p in world.my_planets
-                    if _get_quadrant(p) == fq
-                    and p.id not in target_locked
-                    and available[p.id] - spent[p.id] < GARRISON_TARGET * 2
-                ])
-            all_frontier.sort(key=lambda p: dist(parent.x, parent.y, p.x, p.y))
-            for fp in all_frontier:
-                aim = aim_at_target(parent, fp, surplus, world.initial_by_id,
-                                    world.ang_vel, world=world)
-                if aim is None:
-                    continue
-                angle, turns = aim
-                if turns <= SEGMENT_MAX_TURNS * 2:
-                    _commit_fleet(world, moves, spent, target_locked,
-                                  parent.id, fp.id, angle, turns, int(surplus))
-                    mode_log[parent.id] = "parent-to-frontier"
-                    break
+            my_q = _get_quadrant(parent)
+            frontier_q = _frontier_quadrant(my_q, world.ang_vel)
+            is_frontier_parent = (my_q == frontier_q)
+
+            if not is_frontier_parent:
+                # Non-frontier parent: send all ships to nearest frontier parent
+                frontier_parents = sorted(
+                    [p for p in parents
+                     if p.id != parent.id
+                     and _get_quadrant(p) == frontier_q
+                     and p.id not in target_locked],
+                    key=lambda p: dist(parent.x, parent.y, p.x, p.y)
+                )
+                for fp in frontier_parents:
+                    aim = aim_at_target(parent, fp, surplus, world.initial_by_id,
+                                        world.ang_vel, world=world)
+                    if aim is None:
+                        continue
+                    angle, turns = aim
+                    # Allow longer range since this is intentional relay
+                    if turns <= SEGMENT_MAX_TURNS * 3:
+                        _commit_fleet(world, moves, spent, target_locked,
+                                      parent.id, fp.id, angle, turns, int(surplus))
+                        mode_log[parent.id] = "parent-to-frontier-parent"
+                        pooled = True
+                        break
+
+            if not pooled:
+                # Frontier parent or no frontier parent: send to any frontier planet
+                all_frontier = []
+                occupied_qs = set(_get_quadrant(p) for p in world.my_planets)
+                for oq in occupied_qs:
+                    fq = _frontier_quadrant(oq, world.ang_vel)
+                    all_frontier.extend([
+                        p for p in world.my_planets
+                        if _get_quadrant(p) == fq
+                        and p.id not in target_locked
+                        and available[p.id] - spent[p.id] < GARRISON_TARGET * 2
+                    ])
+                all_frontier.sort(key=lambda p: dist(parent.x, parent.y, p.x, p.y))
+                for fp in all_frontier:
+                    aim = aim_at_target(parent, fp, surplus, world.initial_by_id,
+                                        world.ang_vel, world=world)
+                    if aim is None:
+                        continue
+                    angle, turns = aim
+                    if turns <= SEGMENT_MAX_TURNS * 2:
+                        _commit_fleet(world, moves, spent, target_locked,
+                                      parent.id, fp.id, angle, turns, int(surplus))
+                        mode_log[parent.id] = "parent-to-frontier"
+                        break
 
 
 def handle_enemy_assault(world, available, spent, target_locked, moves, mode_log):
