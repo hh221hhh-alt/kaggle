@@ -647,6 +647,11 @@ def is_static_planet(p):
     return orbital_radius(p) + p.radius >= ROTATION_LIMIT
 
 
+def _init_is_static(init):
+    """True if a planet's INITIAL position makes it static (outside rotation)."""
+    return dist(init.x, init.y, CENTER_X, CENTER_Y) + init.radius >= ROTATION_LIMIT
+
+
 
 def point_to_segment_distance(px, py, x1, y1, x2, y2):
     dx, dy = x2 - x1, y2 - y1
@@ -749,7 +754,7 @@ def orbital_target_approaching(src, target, world):
     init = world.initial_by_id.get(target.id)
     if init is None:
         return True
-    if dist(init.x, init.y, CENTER_X, CENTER_Y) + init.radius >= ROTATION_LIMIT:
+    if _init_is_static(init):
         return True
     cur_angle = math.atan2(target.y - CENTER_Y, target.x - CENTER_X)
     next_angle = cur_angle + world.ang_vel
@@ -800,7 +805,7 @@ def aim_at_target(src, target, ships, initial_by_id, ang_vel, world=None,
                 init = initial_by_id.get(target.id)
                 if init is None:
                     pos = None
-                elif dist(init.x, init.y, CENTER_X, CENTER_Y) + init.radius >= ROTATION_LIMIT:
+                elif _init_is_static(init):
                     pos = None
                 else:
                     pos = predict_planet_position(target, initial_by_id, ang_vel, future_t)
@@ -817,7 +822,7 @@ def aim_at_target(src, target, ships, initial_by_id, ang_vel, world=None,
         init = initial_by_id.get(target.id)
         if init is None:
             result = est
-        elif dist(init.x, init.y, CENTER_X, CENTER_Y) + init.radius >= ROTATION_LIMIT:
+        elif _init_is_static(init):
             result = est
         else:
             result = None
@@ -2609,7 +2614,7 @@ def _commit_fleet(world, moves, spent, target_locked,
             # Static planets in home territory: no direction check
             init = world.initial_by_id.get(tgt_obj.id)
             is_static = (init is not None and
-                         dist(init.x, init.y, CENTER_X, CENTER_Y) + init.radius >= ROTATION_LIMIT)
+                         _init_is_static(init))
             in_home = (_home_quadrant is not None and
                        _get_quadrant(tgt_obj) == _home_quadrant)
             if not early_neutral and not (is_static and in_home):
@@ -3292,7 +3297,7 @@ def _effective_target_dist(src, tgt, world):
     init = world.initial_by_id.get(tgt.id)
     if init is None:
         return raw
-    if dist(init.x, init.y, CENTER_X, CENTER_Y) + init.radius >= ROTATION_LIMIT:
+    if _init_is_static(init):
         return raw
     speed = fleet_speed(50)
     travel = max(1, int(math.ceil(raw / speed)))
@@ -3322,7 +3327,7 @@ def _score_target(src, tgt, world):
         dlimit = HOME_RETURN_DIST_2P if world.is_2p else HOME_RETURN_DIST_4P
         init = world.initial_by_id.get(tgt.id)
         is_static = (init is not None and
-                     dist(init.x, init.y, CENTER_X, CENTER_Y) + init.radius >= ROTATION_LIMIT)
+                     _init_is_static(init))
         if is_static:
             if dist(tgt.x, tgt.y, hx, hy) <= dlimit:
                 dist_score = min(10.0, dist_score + 3.0)
@@ -3868,9 +3873,7 @@ def _try_coalition_expand(world, src, tgt, max_travel, available, spent,
 
 def _get_quadrant(planet):
     """Return 0-3: NW=0, SW=1, NE=2, SE=3."""
-    x_half = 1 if planet.x >= CENTER_X else 0
-    y_half = 1 if planet.y >= CENTER_Y else 0
-    return x_half * 2 + y_half
+    return _get_quadrant_from_pos(planet.x, planet.y)
 
 
 # Clockwise rotation: SE(3)→NE(2)→NW(0)→SW(1)→SE(3)
