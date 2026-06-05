@@ -2011,6 +2011,8 @@ def _record_2p_progress(my_prod_share, intended_patient, reset=False):
 
 _agent_step = 0
 _game_num_players = None
+_home_quadrant = None       # fixed home quadrant (set at step 0)
+_parent_ids = []            # fixed parent planet IDs (set at step 0)
 _starting_max_prod = None   # max production of starting planets (set at step 0)
 _2p_patient_streak = 0
 _2p_prod_share_history = []
@@ -4379,9 +4381,16 @@ def _wall_dist_in_quadrant(p):
 
 
 def _select_parents(world):
-    """Select up to 2 parent planets per occupied quadrant.
-    Static planets only. Pick the 2 most central (furthest from quadrant walls).
+    """Select parent planets.
+    If _parent_ids is set (after game start), return those planets if still owned.
+    Otherwise compute: 1 most central static planet per occupied quadrant.
     """
+    if _parent_ids:
+        # Return fixed parents we still own
+        return [world.planet_by_id[pid] for pid in _parent_ids
+                if pid in world.planet_by_id and world.planet_by_id[pid].owner == world.player]
+
+    # Initial selection: 1 most central static planet per quadrant
     quadrants = defaultdict(list)
     for p in world.my_planets:
         quadrants[_get_quadrant(p)].append(p)
@@ -4390,7 +4399,7 @@ def _select_parents(world):
     for q, planets in quadrants.items():
         candidates = sorted(
             [p for p in planets if is_static_planet(p)],
-            key=lambda p: -_wall_dist_in_quadrant(p)  # most central first
+            key=lambda p: -_wall_dist_in_quadrant(p)
         )
         parents.extend(candidates[:1])
     return parents
@@ -4777,29 +4786,30 @@ def handle_reinforce_surplus(world, available, spent, target_locked, moves, mode
 
 
 def handle_home_reinforce(world, available, spent, target_locked, moves, mode_log):
-    """Full evacuation of outside-territory planets back to home zone.
-    Sends ALL available ships (no reserve left behind) to the nearest home planet.
+    """Evacuate rotating planets that have drifted out of the fixed home quadrant.
+    The home quadrant (_home_quadrant) is fixed at game start.
+    Uses initial_by_id to detect which planets STARTED in home quadrant.
     """
-    if world.home_center is None:
+    if _home_quadrant is None:
         return
-    hx, hy = world.home_center
-    dist_limit = HOME_RETURN_DIST_2P if world.is_2p else HOME_RETURN_DIST_4P
 
-    away_planets = [p for p in world.my_planets
-                    if dist(p.x, p.y, hx, hy) > dist_limit]
-    if not away_planets:
-        return
     home_planets = [p for p in world.my_planets
-                    if dist(p.x, p.y, hx, hy) <= dist_limit]
+                    if _get_quadrant(p) == _home_quadrant]
     if not home_planets:
         return
 
-    for src in away_planets:
-        # Force evacuation regardless of mode_log (except defense in progress)
+    for src in world.my_planets:
+        if _get_quadrant(src) == _home_quadrant:
+            continue  # already in home quadrant
+        # Check if this planet STARTED in home quadrant (rotating planet that drifted)
+        init = world.initial_by_id.get(src.id)
+        if init is None:
+            continue
+        if _get_quadrant_from_pos(init.x, init.y) != _home_quadrant:
+            continue  # started in different quadrant, not our territory
         if mode_log.get(src.id) in ("defended-by-solo", "defended-by-coalition",
                                     "doom-evac-launched", "comet-evac"):
             continue
-        # Send ALL ships — full evacuation, no reserve
         avail = available[src.id] - spent[src.id]
         if avail <= 0:
             continue
@@ -4824,13 +4834,15 @@ def agent(obs, config=None):
     global _agent_step, _pending_commitments
     global _game_num_players, _2p_patient_streak, _2p_prod_share_history
 
-    global _opp_profile, _starting_max_prod
+    global _opp_profile, _starting_max_prod, _home_quadrant, _parent_ids
     obs_step = _read(obs, "step", 0) or 0
     if obs_step == 0:
         _agent_step = 0
         _pending_commitments = []
         _game_num_players = None
         _starting_max_prod = None
+        _home_quadrant = None
+        _parent_ids = []
         _2p_patient_streak = 0
         _2p_prod_share_history = []
         _neutral_prev_ships.clear()
@@ -4847,9 +4859,12 @@ def agent(obs, config=None):
     if not world.my_planets:
         return []
 
-    # Record max production of starting planets at step 0
-    if obs_step == 0 and _starting_max_prod is None:
+    # Initialize fixed values at step 0
+    if obs_step == 0 and world.my_planets:
         _starting_max_prod = max((int(p.production) for p in world.my_planets), default=1)
+        # Fix home quadrant and parents once at game start
+        _home_quadrant = _get_quadrant(world.my_planets[0])
+        _parent_ids = [p.id for p in _select_parents(world)]
 
     
     if not world.is_2p:
