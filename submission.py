@@ -2608,16 +2608,13 @@ def _commit_fleet(world, moves, spent, target_locked,
             return
         src_obj = world.planet_by_id.get(int(src_id))
         if src_obj is not None:
-            # Early game: skip direction check for neutrals (land-grab phase)
-            early_neutral = (world.step < PARENT_START_TURN
-                             and tgt_obj.owner == -1)
             # Static planets in home territory: no direction check
             init = world.initial_by_id.get(tgt_obj.id)
             is_static = (init is not None and
                          _init_is_static(init))
             in_home = (_home_quadrant is not None and
                        _get_quadrant(tgt_obj) == _home_quadrant)
-            if not early_neutral and not (is_static and in_home):
+            if not (is_static and in_home):
                 if not is_in_approaching_direction(src_obj, tgt_obj, world.ang_vel):
                     return
     moves.append([src_id, float(angle), int(ships)])
