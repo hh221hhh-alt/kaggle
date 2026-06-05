@@ -161,6 +161,8 @@ FWD_STAB_HORIZON = 15
 
 GARRISON_TARGET = 10           # keep each planet at this many ships
 SEGMENT_MAX_TURNS = 10         # never fire if arrival takes more than this many turns
+EARLY_GAME_TURNS = 50          # aggressive early phase: fire when garrison > 5
+EARLY_MIN_SHIPS = 5            # minimum fleet size in early game
 HOME_RETURN_DIST_2P = 35.0     # send ships home if farther than this (2P)
 HOME_RETURN_DIST_4P = 22.0     # send ships home if farther than this (4P)
 ENEMY_ASSAULT_RATIO = 1.5      # launch all-out attack when we have this multiple of enemy garrison
@@ -2579,7 +2581,8 @@ def _commit_fleet(world, moves, spent, target_locked,
     - Enemy/neutral targets must be in approaching direction (not chasing)
     - Turn limit SEGMENT_MAX_TURNS for enemy/neutral targets
     """
-    if int(ships) < MIN_DISPATCH_SHIPS:
+    min_ships = EARLY_MIN_SHIPS if world.step < EARLY_GAME_TURNS else MIN_DISPATCH_SHIPS
+    if int(ships) < min_ships:
         return
     tgt_obj = world.planet_by_id.get(int(target_id))
     if tgt_obj is not None and tgt_obj.owner != world.player:
@@ -4135,6 +4138,45 @@ def handle_waypoint_capture(world, available, spent, target_locked, moves, mode_
             break
 
 
+def handle_home_sweep(world, available, spent, target_locked, moves, mode_log):
+    """After EARLY_GAME_TURNS: capture ALL non-friendly planets inside home zone."""
+    if world.step < EARLY_GAME_TURNS:
+        return
+    if world.home_center is None:
+        return
+    hx, hy = world.home_center
+    dist_limit = HOME_RETURN_DIST_2P if world.is_2p else HOME_RETURN_DIST_4P
+
+    home_targets = sorted(
+        [p for p in world.planets
+         if p.owner != world.player
+         and p.id not in target_locked
+         and is_targetable(world, p)
+         and dist(p.x, p.y, hx, hy) <= dist_limit],
+        key=lambda p: int(p.ships)  # easiest first
+    )
+    for tgt in home_targets:
+        for src in sorted(world.my_planets,
+                          key=lambda p: dist(p.x, p.y, tgt.x, tgt.y)):
+            if mode_log.get(src.id):
+                continue
+            avail = available[src.id] - spent[src.id]
+            need = int(tgt.ships) + 1
+            send = max(MIN_DISPATCH_SHIPS, min(need, ATTACK_MAX_SHIPS))
+            if avail < send + GARRISON_TARGET:
+                continue
+            aim = aim_at_target(src, tgt, send, world.initial_by_id,
+                                world.ang_vel, world=world, check_approach=True)
+            if aim is None:
+                continue
+            angle, turns = aim
+            _commit_fleet(world, moves, spent, target_locked,
+                          src.id, tgt.id, angle, turns, int(send))
+            mode_log[src.id] = "home-sweep"
+            mode_log[tgt.id] = "home-sweep-target"
+            break
+
+
 def handle_home_attack(world, available, spent, target_locked, moves, mode_log):
     """Attack enemy planets inside our home zone with priority."""
     if world.home_center is None or not world.enemy_planets:
@@ -4180,12 +4222,18 @@ def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
         hx, hy = world.home_center
         dist_limit = HOME_RETURN_DIST_2P if world.is_2p else HOME_RETURN_DIST_4P
 
+    is_early = world.step < EARLY_GAME_TURNS
+
     for src in world.my_planets:
         if mode_log.get(src.id):
             continue
         avail = available[src.id] - spent[src.id]
-        if avail <= GARRISON_TARGET * 2:  # fire when > 20
-            continue
+        if is_early:
+            if avail <= EARLY_MIN_SHIPS:  # fire when > 5 in early game
+                continue
+        else:
+            if avail <= GARRISON_TARGET * 2:  # fire when > 20 in mid/late game
+                continue
 
         # Find capturable targets (garrison <= ATTACK_MAX_SHIPS - 1 = 19)
         candidates = sorted(
@@ -4198,8 +4246,10 @@ def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
             key=lambda p: -_score_target(src, p, world)
         )
         for tgt in candidates:
-            send = max(MIN_DISPATCH_SHIPS, min(int(tgt.ships) + 1, ATTACK_MAX_SHIPS))
-            if avail < send + GARRISON_TARGET:
+            min_send = EARLY_MIN_SHIPS if is_early else MIN_DISPATCH_SHIPS
+            send = max(min_send, min(int(tgt.ships) + 1, ATTACK_MAX_SHIPS))
+            keep = EARLY_MIN_SHIPS if is_early else GARRISON_TARGET
+            if avail < send + keep:
                 continue
             aim = aim_at_target(src, tgt, send, world.initial_by_id,
                                 world.ang_vel, world=world, check_approach=True)
@@ -4304,6 +4354,8 @@ def plan_moves(world, deadline=None):
     handle_comet_evac(world, available, spent, target_locked, moves, mode_log)
     handle_defense(world, rescue_needs, available, spent, target_locked, moves, mode_log)
 
+    if not _over_budget():
+        handle_home_sweep(world, available, spent, target_locked, moves, mode_log)
     if not _over_budget():
         handle_home_attack(world, available, spent, target_locked, moves, mode_log)
     if not _over_budget():
