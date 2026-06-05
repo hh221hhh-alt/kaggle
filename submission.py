@@ -4392,7 +4392,7 @@ def _select_parents(world):
             [p for p in planets if is_static_planet(p)],
             key=lambda p: -_wall_dist_in_quadrant(p)  # most central first
         )
-        parents.extend(candidates[:2])
+        parents.extend(candidates[:1])
     return parents
 
 
@@ -4452,10 +4452,17 @@ def handle_parent_collect(world, available, spent, target_locked, moves, mode_lo
         return
     parent_ids = {p.id for p in parents}
 
+    # Determine frontier quadrants to exclude (they should attack, not feed back)
+    frontier_qs = set()
+    for p in parents:
+        frontier_qs.add(_frontier_quadrant(_get_quadrant(p), world.ang_vel))
+
     for src in sorted(world.my_planets,
                       key=lambda p: -(available[p.id] - spent[p.id])):
         if src.id in parent_ids:
             continue
+        if _get_quadrant(src) in frontier_qs:
+            continue  # frontier planets use ships for attack, not feeding parent
         if mode_log.get(src.id):
             continue
         avail = available[src.id] - spent[src.id]
