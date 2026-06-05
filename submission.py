@@ -4271,12 +4271,23 @@ def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
 
     is_early = world.step < EARLY_GAME_TURNS
 
+    # Statuses that mean the planet must NOT launch (defending/absorbing/evacuating)
+    _block = ("defense", "defended-by-solo", "defended-by-coalition",
+              "doom-evac-launched", "comet-evac", "home-evac")
+
     for src in world.my_planets:
-        if mode_log.get(src.id):
-            continue
+        status = mode_log.get(src.id)
+        if is_early:
+            # Early game: only block defenders/evacuees; planets that merely
+            # RECEIVED reinforcements may still launch their surplus (speed).
+            if status and (status.startswith("absorb") or status in _block):
+                continue
+        else:
+            if status:
+                continue
         avail = available[src.id] - spent[src.id]
         if is_early:
-            if avail <= EARLY_MIN_SHIPS:  # fire when > 5
+            if avail <= GARRISON_TARGET:  # keep 10, fire the rest
                 continue
         else:
             if avail <= GARRISON_TARGET * 2:  # fire when > 20
@@ -4298,7 +4309,7 @@ def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
                 continue
             min_send = EARLY_MIN_SHIPS if is_early else MIN_DISPATCH_SHIPS
             send = max(min_send, min(int(tgt.ships) + 1, ATTACK_MAX_SHIPS))
-            keep = EARLY_MIN_SHIPS if is_early else GARRISON_TARGET
+            keep = GARRISON_TARGET  # keep 10 on the planet
             avail = available[src.id] - spent[src.id]
             if avail < send + keep:
                 if is_early:
