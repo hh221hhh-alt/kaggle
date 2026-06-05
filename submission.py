@@ -3904,13 +3904,8 @@ def handle_collector_fleets(world, available, spent, target_locked, moves, mode_
         if not planets:
             continue
 
-        # Only consider planets with 100+ ships for collection
-        rich_planets = [p for p in planets if int(p.ships) >= 100]
-        if not rich_planets:
-            continue
-
-        # Active collector = planet with most available ships among rich planets
-        collector = max(rich_planets, key=lambda p: available[p.id] - spent[p.id])
+        # Active collector = planet with most available ships in this quadrant
+        collector = max(planets, key=lambda p: available[p.id] - spent[p.id])
         pid = collector.id
 
         if mode_log.get(pid):
@@ -3956,9 +3951,11 @@ def handle_collector_fleets(world, available, spent, target_locked, moves, mode_
         cascade_limit = SEGMENT_MAX_TURNS * 2 if (surplus >= 300 or world.step >= 60) else SEGMENT_MAX_TURNS
 
         next_planet = None
-        # Try frontier planets first (sorted by distance)
+        # Try frontier planets first (sorted by ship count desc, then distance)
         for fp in sorted(frontier_planets,
-                         key=lambda p: dist(collector.x, collector.y, p.x, p.y)):
+                         key=lambda p: (-int(p.ships), dist(collector.x, collector.y, p.x, p.y))):
+            if fp.id in target_locked:
+                continue
             aim = aim_at_target(collector, fp, surplus, world.initial_by_id,
                                 world.ang_vel, world=world)
             if aim is None:
@@ -3968,7 +3965,7 @@ def handle_collector_fleets(world, available, spent, target_locked, moves, mode_
                 next_planet = fp
                 break
 
-        # Fall back: nearest reachable planet in any quadrant
+        # Fall back: nearest reachable planet in any quadrant (not locked)
         if next_planet is None:
             circuit = _build_circuit(planets, world)
             if len(circuit) > 1:
@@ -3976,7 +3973,7 @@ def handle_collector_fleets(world, available, spent, target_locked, moves, mode_
                 for j in range(1, len(circuit)):
                     nid = circuit[(idx + j) % len(circuit)]
                     np = world.planet_by_id.get(nid)
-                    if np is None:
+                    if np is None or np.id in target_locked:
                         continue
                     aim = aim_at_target(collector, np, surplus, world.initial_by_id,
                                         world.ang_vel, world=world)
@@ -3987,10 +3984,10 @@ def handle_collector_fleets(world, available, spent, target_locked, moves, mode_
                         next_planet = np
                         break
 
-        # Last resort: find ANY reachable friendly planet (no turn limit)
+        # Last resort: find ANY reachable friendly planet (no turn limit, not locked)
         if next_planet is None:
             other_friendly = sorted(
-                [p for p in world.my_planets if p.id != pid],
+                [p for p in world.my_planets if p.id != pid and p.id not in target_locked],
                 key=lambda p: dist(collector.x, collector.y, p.x, p.y)
             )
             for fp in other_friendly:
@@ -4058,40 +4055,46 @@ def handle_intercept(world, available, spent, target_locked, moves, mode_log):
                     break
 
 
-def handle_frontier_reinforce(world, available, spent, target_locked, moves, mode_log):
-    """Idea 5: concentrate surplus ships at our frontier planets (closest to enemies).
-    Sends from safe backline planets to frontier planets.
+def handle_flow_to_frontier(world, available, spent, target_locked, moves, mode_log):
+    """All planets with surplus >20 send toward the frontier quadrant via relay.
+    Each relay planet only receives from ONE source per turn (target_locked check).
+    Planets sorted by most surplus first to prioritize big stockpiles.
     """
-    if not world.enemy_planets:
-        return
-    # Mark frontier: our planets within 35 units of any enemy planet
-    FRONTIER_DIST = 35.0
-    frontier = [p for p in world.my_planets
-                if min(dist(p.x, p.y, e.x, e.y) for e in world.enemy_planets) <= FRONTIER_DIST]
-    backline = [p for p in world.my_planets
-                if min(dist(p.x, p.y, e.x, e.y) for e in world.enemy_planets) > FRONTIER_DIST]
-    if not frontier or not backline:
-        return
-    for src in backline:
+    for src in sorted(world.my_planets,
+                      key=lambda p: -(available[p.id] - spent[p.id])):
         if mode_log.get(src.id):
             continue
         avail = available[src.id] - spent[src.id]
-        if avail <= GARRISON_TARGET:
+        if avail <= GARRISON_TARGET * 2:  # need >20
             continue
-        send = avail - GARRISON_TARGET
-        # Find nearest frontier planet that can accept ships
-        dst = min(frontier, key=lambda p: dist(src.x, src.y, p.x, p.y))
-        aim = aim_at_target(src, dst, send, world.initial_by_id,
-                            world.ang_vel, world=world)
-        if aim is None:
-            continue
-        angle, turns = aim
-        if turns > SEGMENT_MAX_TURNS:
-            continue
-        _commit_fleet(world, moves, spent, target_locked,
-                      src.id, dst.id, angle, turns, int(send))
-        mode_log[src.id] = "frontier-reinforce"
-        mode_log[dst.id] = "frontier-receiver"
+        surplus = avail - GARRISON_TARGET
+
+        src_q = _get_quadrant(src)
+        frontier_q = _frontier_quadrant(src_q, world.ang_vel)
+
+        # Prefer frontier quadrant planets with most ships, then any nearby
+        candidates = sorted(
+            [p for p in world.my_planets
+             if p.id != src.id and p.id not in target_locked],
+            key=lambda p: (
+                0 if _get_quadrant(p) == frontier_q else 1,  # frontier first
+                -int(p.ships),                                 # most ships first
+                dist(src.x, src.y, p.x, p.y)                 # nearest
+            )
+        )
+
+        for dst in candidates:
+            aim = aim_at_target(src, dst, surplus, world.initial_by_id,
+                                world.ang_vel, world=world)
+            if aim is None:
+                continue
+            angle, turns = aim
+            if turns > SEGMENT_MAX_TURNS:
+                continue
+            _commit_fleet(world, moves, spent, target_locked,
+                          src.id, dst.id, angle, turns, int(surplus))
+            mode_log[src.id] = "flow-to-frontier"
+            break
 
 
 def handle_opportunistic_attack(world, available, spent, target_locked, moves, mode_log):
@@ -4471,7 +4474,7 @@ def plan_moves(world, deadline=None):
     if not _over_budget():
         handle_opportunistic_attack(world, available, spent, target_locked, moves, mode_log)
     if not _over_budget():
-        handle_frontier_reinforce(world, available, spent, target_locked, moves, mode_log)
+        handle_flow_to_frontier(world, available, spent, target_locked, moves, mode_log)
     if not _over_budget():
         handle_waypoint_capture(world, available, spent, target_locked, moves, mode_log)
     if not _over_budget():
