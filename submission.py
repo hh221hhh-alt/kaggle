@@ -4375,9 +4375,8 @@ def _select_parents(world):
 
     parents = []
     for q, planets in quadrants.items():
-        # Prefer static planets
-        static = [p for p in planets if is_static_planet(p)]
-        candidates = static if len(static) >= 2 else planets
+        # Static planets only
+        candidates = [p for p in planets if is_static_planet(p)]
 
         if len(candidates) == 0:
             continue
@@ -4481,16 +4480,23 @@ def handle_parent_collect(world, available, spent, target_locked, moves, mode_lo
 
 
 def handle_parent_attack(world, available, spent, target_locked, moves, mode_log):
-    """Parent planets attack the best reachable target with exact needed ships."""
+    """Parent planets attack best target. If not enough ships, send surplus
+    to another parent to accumulate (parent coordination).
+    """
     if not PARENT_ENABLED:
         return
     parents = _select_parents(world)
+    if not parents:
+        return
+
     for parent in parents:
         if mode_log.get(parent.id):
             continue
         avail = available[parent.id] - spent[parent.id]
         if avail <= GARRISON_TARGET:
             continue
+
+        # Find best target
         candidates = sorted(
             [p for p in world.planets
              if p.owner != world.player
@@ -4498,21 +4504,48 @@ def handle_parent_attack(world, available, spent, target_locked, moves, mode_log
              and is_targetable(world, p)],
             key=lambda p: -_score_target(parent, p, world)
         )
+
+        attacked = False
         for tgt in candidates:
             if friendly_already_committed(world, tgt.id):
                 continue
             need = int(tgt.ships) + 1
             if avail < need + GARRISON_TARGET:
-                continue
-            aim = aim_at_target(parent, tgt, need, world.initial_by_id,
-                                world.ang_vel, world=world, check_approach=True)
-            if aim is None:
-                continue
-            angle, turns = aim
-            _commit_fleet(world, moves, spent, target_locked,
-                          parent.id, tgt.id, angle, turns, int(need))
-            mode_log[parent.id] = "parent-attack"
-            break
+                # Not enough ships — send surplus to another parent to pool
+                surplus = avail - GARRISON_TARGET
+                if surplus < MIN_DISPATCH_SHIPS:
+                    continue
+                other_parents = [p for p in parents
+                                 if p.id != parent.id
+                                 and p.id not in target_locked
+                                 and not mode_log.get(p.id)]
+                if not other_parents:
+                    continue
+                dst = min(other_parents,
+                          key=lambda p: dist(parent.x, parent.y, p.x, p.y))
+                aim = aim_at_target(parent, dst, surplus, world.initial_by_id,
+                                    world.ang_vel, world=world)
+                if aim is None:
+                    continue
+                angle, turns = aim
+                if turns > SEGMENT_MAX_TURNS:
+                    continue
+                _commit_fleet(world, moves, spent, target_locked,
+                              parent.id, dst.id, angle, turns, int(surplus))
+                mode_log[parent.id] = "parent-pool"
+                attacked = True
+                break
+            else:
+                aim = aim_at_target(parent, tgt, need, world.initial_by_id,
+                                    world.ang_vel, world=world, check_approach=True)
+                if aim is None:
+                    continue
+                angle, turns = aim
+                _commit_fleet(world, moves, spent, target_locked,
+                              parent.id, tgt.id, angle, turns, int(need))
+                mode_log[parent.id] = "parent-attack"
+                attacked = True
+                break
 
 
 def handle_enemy_assault(world, available, spent, target_locked, moves, mode_log):
