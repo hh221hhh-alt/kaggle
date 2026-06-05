@@ -3346,6 +3346,10 @@ def _score_target(src, tgt, world):
     max_garrison = max(1, ATTACK_MAX_SHIPS - 1)
     cost_score = max(0.0, 10.0 * (1.0 - garrison / max_garrison))
 
+    # Early game weighting: distance x4, production x3, cost(low garrison) x4
+    if world.step < EARLY_GAME_TURNS:
+        return dist_score * 4 + prod_score * 3 + cost_score * 4
+
     return dist_score + prod_score + cost_score
 
 
