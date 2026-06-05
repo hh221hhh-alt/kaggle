@@ -2587,9 +2587,14 @@ def _commit_fleet(world, moves, spent, target_locked,
             return
         src_obj = world.planet_by_id.get(int(src_id))
         if src_obj is not None:
-            # Use current position for direction check (simpler and reliable)
-            if not is_in_approaching_direction(src_obj, tgt_obj, world.ang_vel):
-                return
+            # Static planets nearby: skip direction check (idea 4)
+            d = dist(src_obj.x, src_obj.y, tgt_obj.x, tgt_obj.y)
+            init = world.initial_by_id.get(tgt_obj.id)
+            is_static = (init is not None and
+                         dist(init.x, init.y, CENTER_X, CENTER_Y) + init.radius >= ROTATION_LIMIT)
+            if not (is_static and d < 20.0):
+                if not is_in_approaching_direction(src_obj, tgt_obj, world.ang_vel):
+                    return
     moves.append([src_id, float(angle), int(ships)])
     spent[src_id] += int(ships)
     target_locked.add(target_id)
@@ -4138,7 +4143,8 @@ def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
         if mode_log.get(src.id):
             continue
         avail = available[src.id] - spent[src.id]
-        if avail < GARRISON_TARGET * 2:
+        # Fire as soon as any surplus exists above GARRISON_TARGET
+        if avail <= GARRISON_TARGET:
             continue
         targets = sorted(
             [p for p in world.planets
@@ -4147,7 +4153,8 @@ def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
              and is_targetable(world, p)
              and int(p.ships) < send
              and (home_clear or (hx is not None and dist(p.x, p.y, hx, hy) <= dist_limit))],
-            key=lambda p: (-int(p.production), dist(src.x, src.y, p.x, p.y))
+            # Distance first; prefer higher production among nearby targets
+            key=lambda p: (dist(src.x, src.y, p.x, p.y), -int(p.production))
         )
         for tgt in targets:
             aim = aim_at_target(src, tgt, send, world.initial_by_id,
@@ -4346,7 +4353,9 @@ def handle_home_reinforce(world, available, spent, target_locked, moves, mode_lo
         return
 
     for src in away_planets:
-        if mode_log.get(src.id):
+        # Force evacuation regardless of mode_log (except defense in progress)
+        if mode_log.get(src.id) in ("defended-by-solo", "defended-by-coalition",
+                                    "doom-evac-launched", "comet-evac"):
             continue
         # Send ALL ships — full evacuation, no reserve
         avail = available[src.id] - spent[src.id]
