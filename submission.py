@@ -2595,6 +2595,8 @@ def _commit_fleet(world, moves, spent, target_locked,
     min_ships = EARLY_MIN_SHIPS if world.step < EARLY_GAME_TURNS else MIN_DISPATCH_SHIPS
     if int(ships) < min_ships:
         return
+    # Cap fleet at 1000 — speed maxes out there, extra ships are wasted
+    ships = min(int(ships), 1000)
     tgt_obj = world.planet_by_id.get(int(target_id))
     if tgt_obj is not None and tgt_obj.owner != world.player:
         if int(turns) > SEGMENT_MAX_TURNS:
