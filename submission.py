@@ -166,6 +166,8 @@ EARLY_MIN_SHIPS = 5            # minimum fleet size in early game
 HOME_RETURN_DIST_2P = 35.0     # send ships home if farther than this (2P)
 HOME_RETURN_DIST_4P = 22.0     # send ships home if farther than this (4P)
 ENEMY_ASSAULT_RATIO = 1.5      # launch all-out attack when we have this multiple of enemy garrison
+COLLECTOR_ENABLED = False      # set True to re-enable collector fleet strategy
+PARENT_ENABLED = True          # parent planet strategy
 OCCUPIED_THRESHOLD = 0.8       # 80% of planets owned = "occupied territory"
 OCCUPIED_TURN = 50             # activate occupied distribution after this turn
 # Opposite quadrant map: SE↔NW, NE↔SW
@@ -4363,6 +4365,156 @@ def _get_quadrant_from_pos(x, y):
     return x_half * 2 + y_half
 
 
+def _select_parents(world):
+    """Select 2 parent planets per occupied quadrant.
+    Prefer static planets. Pick the pair that is furthest apart.
+    """
+    quadrants = defaultdict(list)
+    for p in world.my_planets:
+        quadrants[_get_quadrant(p)].append(p)
+
+    parents = []
+    for q, planets in quadrants.items():
+        # Prefer static planets
+        static = [p for p in planets if is_static_planet(p)]
+        candidates = static if len(static) >= 2 else planets
+
+        if len(candidates) == 0:
+            continue
+        elif len(candidates) == 1:
+            parents.append(candidates[0])
+        else:
+            # Pick the pair with maximum distance between them
+            best_pair = (candidates[0], candidates[1])
+            best_d = dist(candidates[0].x, candidates[0].y,
+                         candidates[1].x, candidates[1].y)
+            for i in range(len(candidates)):
+                for j in range(i + 1, len(candidates)):
+                    d = dist(candidates[i].x, candidates[i].y,
+                             candidates[j].x, candidates[j].y)
+                    if d > best_d:
+                        best_d = d
+                        best_pair = (candidates[i], candidates[j])
+            parents.extend(best_pair)
+    return parents
+
+
+def _planet_initial_quadrant(planet, world):
+    """Return the quadrant the planet started in (using initial_by_id)."""
+    init = world.initial_by_id.get(planet.id)
+    if init is None:
+        return _get_quadrant(planet)
+    return _get_quadrant_from_pos(init.x, init.y)
+
+
+def handle_parent_evac(world, available, spent, target_locked, moves, mode_log):
+    """If a parent planet has rotated out of its initial quadrant, evacuate
+    all its ships back to a planet in its original quadrant.
+    """
+    if not PARENT_ENABLED:
+        return
+    parent_ids = {p.id for p in _select_parents(world)}
+    for src in world.my_planets:
+        if src.id not in parent_ids:
+            continue
+        if mode_log.get(src.id):
+            continue
+        initial_q = _planet_initial_quadrant(src, world)
+        current_q = _get_quadrant(src)
+        if initial_q == current_q:
+            continue  # hasn't drifted
+        # Drifted: evacuate all ships to a planet in the original quadrant
+        avail = available[src.id] - spent[src.id]
+        if avail <= 0:
+            continue
+        home_q_planets = [p for p in world.my_planets
+                         if _get_quadrant(p) == initial_q and p.id != src.id
+                         and p.id not in target_locked]
+        if not home_q_planets:
+            continue
+        dst = min(home_q_planets, key=lambda p: dist(src.x, src.y, p.x, p.y))
+        aim = aim_at_target(src, dst, avail, world.initial_by_id,
+                            world.ang_vel, world=world)
+        if aim is None:
+            continue
+        angle, turns = aim
+        _commit_fleet(world, moves, spent, target_locked,
+                      src.id, dst.id, angle, turns, int(avail))
+        mode_log[src.id] = "parent-evac"
+
+
+def handle_parent_collect(world, available, spent, target_locked, moves, mode_log):
+    """Non-parent planets send surplus (>20) to the nearest available parent."""
+    if not PARENT_ENABLED:
+        return
+    parents = _select_parents(world)
+    if not parents:
+        return
+    parent_ids = {p.id for p in parents}
+
+    for src in sorted(world.my_planets,
+                      key=lambda p: -(available[p.id] - spent[p.id])):
+        if src.id in parent_ids:
+            continue
+        if mode_log.get(src.id):
+            continue
+        avail = available[src.id] - spent[src.id]
+        if avail <= GARRISON_TARGET * 2:
+            continue
+        surplus = avail - GARRISON_TARGET
+
+        # Find nearest parent not already receiving this turn
+        for dst in sorted(parents, key=lambda p: dist(src.x, src.y, p.x, p.y)):
+            if dst.id in target_locked:
+                continue
+            aim = aim_at_target(src, dst, surplus, world.initial_by_id,
+                                world.ang_vel, world=world)
+            if aim is None:
+                continue
+            angle, turns = aim
+            if turns > SEGMENT_MAX_TURNS:
+                continue
+            _commit_fleet(world, moves, spent, target_locked,
+                          src.id, dst.id, angle, turns, int(surplus))
+            mode_log[src.id] = "to-parent"
+            break
+
+
+def handle_parent_attack(world, available, spent, target_locked, moves, mode_log):
+    """Parent planets attack the best reachable target with exact needed ships."""
+    if not PARENT_ENABLED:
+        return
+    parents = _select_parents(world)
+    for parent in parents:
+        if mode_log.get(parent.id):
+            continue
+        avail = available[parent.id] - spent[parent.id]
+        if avail <= GARRISON_TARGET:
+            continue
+        candidates = sorted(
+            [p for p in world.planets
+             if p.owner != world.player
+             and p.id not in target_locked
+             and is_targetable(world, p)],
+            key=lambda p: -_score_target(parent, p, world)
+        )
+        for tgt in candidates:
+            if friendly_already_committed(world, tgt.id):
+                continue
+            need = int(tgt.ships) + 1
+            if avail < need + GARRISON_TARGET:
+                continue
+            aim = aim_at_target(parent, tgt, need, world.initial_by_id,
+                                world.ang_vel, world=world, check_approach=True)
+            if aim is None:
+                continue
+            angle, turns = aim
+            _commit_fleet(world, moves, spent, target_locked,
+                          parent.id, tgt.id, angle, turns, int(need))
+            mode_log[parent.id] = "parent-attack"
+            break
+
+
 def handle_enemy_assault(world, available, spent, target_locked, moves, mode_log):
     """Launch all-out attack on all enemy planets when we have ENEMY_ASSAULT_RATIO times
     their total garrison. Targets sorted by production (highest first).
@@ -4462,8 +4614,14 @@ def plan_moves(world, deadline=None):
     if not _over_budget():
         handle_home_reinforce(world, available, spent, target_locked, moves, mode_log)
     if not _over_budget():
-        handle_reinforce_surplus(world, available, spent, target_locked, moves, mode_log)
+        handle_parent_evac(world, available, spent, target_locked, moves, mode_log)
     if not _over_budget():
+        handle_parent_collect(world, available, spent, target_locked, moves, mode_log)
+    if not _over_budget():
+        handle_parent_attack(world, available, spent, target_locked, moves, mode_log)
+    if not _over_budget():
+        handle_reinforce_surplus(world, available, spent, target_locked, moves, mode_log)
+    if COLLECTOR_ENABLED and not _over_budget():
         handle_collector_fleets(world, available, spent, target_locked, moves, mode_log)
     if not _over_budget():
         handle_steady_fire(world, available, spent, target_locked, moves, mode_log)
