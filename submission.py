@@ -3282,6 +3282,48 @@ def _effective_target_dist(src, tgt, world):
     return dist(src.x, src.y, px, py)
 
 
+def _score_target(src, tgt, world):
+    """Score a target 0-30 using three equal-weight criteria (0-10 each):
+    1. Distance/position: closer is better; bonus if static in home zone or
+       rotating planet enters home zone within 5 turns.
+    2. Production: higher is better.
+    3. Cost: lower garrison is better (cheaper to capture).
+    """
+    # --- 1. Distance / position score (0-10) ---
+    eff_dist = _effective_target_dist(src, tgt, world)
+    # Normalize: 0 units = 10pts, SEGMENT_MAX_TURNS*MAX_SPEED units = 0pts
+    max_dist = float(SEGMENT_MAX_TURNS * MAX_SPEED)
+    dist_score = max(0.0, 10.0 * (1.0 - eff_dist / max_dist))
+
+    # Position bonus: static planet inside home zone (+3)
+    # OR rotating planet that will enter home zone within 5 turns (+3)
+    if world.home_center is not None:
+        hx, hy = world.home_center
+        dlimit = HOME_RETURN_DIST_2P if world.is_2p else HOME_RETURN_DIST_4P
+        init = world.initial_by_id.get(tgt.id)
+        is_static = (init is not None and
+                     dist(init.x, init.y, CENTER_X, CENTER_Y) + init.radius >= ROTATION_LIMIT)
+        if is_static:
+            if dist(tgt.x, tgt.y, hx, hy) <= dlimit:
+                dist_score = min(10.0, dist_score + 3.0)
+        else:
+            for t in range(1, 6):
+                px, py = predict_planet_position(tgt, world.initial_by_id, world.ang_vel, t)
+                if dist(px, py, hx, hy) <= dlimit:
+                    dist_score = min(10.0, dist_score + 3.0)
+                    break
+
+    # --- 2. Production score (0-10) ---
+    prod_score = min(10.0, float(int(tgt.production)) * 2.0)
+
+    # --- 3. Cost score (0-10): lower garrison = higher score ---
+    garrison = int(tgt.ships)
+    max_garrison = max(1, ATTACK_MAX_SHIPS - 1)
+    cost_score = max(0.0, 10.0 * (1.0 - garrison / max_garrison))
+
+    return dist_score + prod_score + cost_score
+
+
 def _counter_snipe_candidates(world, src, max_travel, target_locked):
     """V12.4c: neutrals where a known enemy fleet will capture before us, and
     we can re-flip cheaply on a short follow-up. Returns [(target, raw_dist)]
@@ -4153,10 +4195,7 @@ def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
              and is_targetable(world, p)
              and int(p.ships) < ATTACK_MAX_SHIPS
              and (home_clear or (hx is not None and dist(p.x, p.y, hx, hy) <= dist_limit))],
-            # Opening: distance first (cluster formation); otherwise production first
-            key=lambda p: (dist(src.x, src.y, p.x, p.y), -int(p.production))
-            if world.is_opening else
-            (-int(p.production), dist(src.x, src.y, p.x, p.y))
+            key=lambda p: -_score_target(src, p, world)
         )
         for tgt in candidates:
             send = max(MIN_DISPATCH_SHIPS, min(int(tgt.ships) + 1, ATTACK_MAX_SHIPS))
