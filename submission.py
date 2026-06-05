@@ -2603,13 +2603,16 @@ def _commit_fleet(world, moves, spent, target_locked,
             return
         src_obj = world.planet_by_id.get(int(src_id))
         if src_obj is not None:
+            # Early game: skip direction check for neutrals (land-grab phase)
+            early_neutral = (world.step < PARENT_START_TURN
+                             and tgt_obj.owner == -1)
             # Static planets in home territory: no direction check
             init = world.initial_by_id.get(tgt_obj.id)
             is_static = (init is not None and
                          dist(init.x, init.y, CENTER_X, CENTER_Y) + init.radius >= ROTATION_LIMIT)
             in_home = (_home_quadrant is not None and
                        _get_quadrant(tgt_obj) == _home_quadrant)
-            if not (is_static and in_home):
+            if not early_neutral and not (is_static and in_home):
                 if not is_in_approaching_direction(src_obj, tgt_obj, world.ang_vel):
                     return
     moves.append([src_id, float(angle), int(ships)])
@@ -4292,8 +4295,11 @@ def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
             min_send = EARLY_MIN_SHIPS if is_early else MIN_DISPATCH_SHIPS
             send = max(min_send, min(int(tgt.ships) + 1, ATTACK_MAX_SHIPS))
             keep = EARLY_MIN_SHIPS if is_early else GARRISON_TARGET
+            avail = available[src.id] - spent[src.id]
             if avail < send + keep:
-                continue
+                if is_early:
+                    continue  # try a cheaper target
+                break
             aim = aim_at_target(src, tgt, send, world.initial_by_id,
                                 world.ang_vel, world=world, check_approach=True)
             if aim is None:
@@ -4302,7 +4308,9 @@ def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
             _commit_fleet(world, moves, spent, target_locked,
                           src.id, tgt.id, angle, turns, int(send))
             mode_log[src.id] = "steady-fire"
-            break
+            # Early game: keep firing from this rich planet at more targets
+            if not is_early:
+                break
 
 
 def handle_occupied_distribute(world, available, spent, target_locked, moves, mode_log):
@@ -4736,8 +4744,15 @@ def plan_moves(world, deadline=None):
         if not holds:
             rescue_needs[p.id] = (deficit, dline, p)
             mode_log[p.id] = "absorb-need-rescue"
-        elif arrivals:
-            mode_log[p.id] = "absorb"
+        else:
+            # Only mark 'absorb' when HOSTILE fleets incoming (need to hold ships).
+            # Friendly arrivals must NOT block this planet from launching.
+            hostile_incoming = any(
+                owner != world.player and owner != -1 and ships > 0
+                for _eta, owner, ships in arrivals
+            )
+            if hostile_incoming:
+                mode_log[p.id] = "absorb"
 
     def _over_budget():
         return deadline is not None and time.perf_counter() >= deadline
