@@ -169,6 +169,7 @@ HOME_RETURN_DIST_4P = 22.0     # send ships home if farther than this (4P)
 ENEMY_ASSAULT_RATIO = 1.5      # launch all-out attack when we have this multiple of enemy garrison
 COLLECTOR_ENABLED = False      # set True to re-enable collector fleet strategy
 PARENT_ENABLED = True          # parent planet strategy
+PARENT_START_TURN = 50         # parent strategy activates after this turn
 OCCUPIED_THRESHOLD = 0.8       # 80% of planets owned = "occupied territory"
 OCCUPIED_TURN = 50             # activate occupied distribution after this turn
 # Opposite quadrant map: SE↔NW, NE↔SW
@@ -4381,28 +4382,23 @@ def _wall_dist_in_quadrant(p):
 
 
 def _select_parents(world):
-    """Select parent planets.
-    If _parent_ids is set (after game start), return those planets if still owned.
-    Otherwise compute: 1 most central static planet per occupied quadrant.
-    """
-    if _parent_ids:
-        # Return fixed parents we still own
-        return [world.planet_by_id[pid] for pid in _parent_ids
-                if pid in world.planet_by_id and world.planet_by_id[pid].owner == world.player]
+    """Return fixed parent planets (set once at PARENT_START_TURN) still owned.
+    Returns empty list if parents haven't been fixed yet."""
+    if not _parent_ids:
+        return []
+    return [world.planet_by_id[pid] for pid in _parent_ids
+            if pid in world.planet_by_id and world.planet_by_id[pid].owner == world.player]
 
-    # Initial selection: 1 most central static planet per quadrant
-    quadrants = defaultdict(list)
-    for p in world.my_planets:
-        quadrants[_get_quadrant(p)].append(p)
 
-    parents = []
-    for q, planets in quadrants.items():
-        candidates = sorted(
-            [p for p in planets if is_static_planet(p)],
-            key=lambda p: -_wall_dist_in_quadrant(p)
-        )
-        parents.extend(candidates[:1])
-    return parents
+def _compute_parent_candidates(world):
+    """Compute the best static parent in the home quadrant (most central).
+    Used once at PARENT_START_TURN to fix parents."""
+    home_static = [p for p in world.my_planets
+                   if _get_quadrant(p) == _home_quadrant and is_static_planet(p)]
+    if not home_static:
+        return []
+    home_static.sort(key=lambda p: -_wall_dist_in_quadrant(p))
+    return home_static[:1]
 
 
 def _planet_initial_quadrant(planet, world):
@@ -4417,7 +4413,7 @@ def handle_parent_evac(world, available, spent, target_locked, moves, mode_log):
     """If a parent planet has rotated out of its initial quadrant, evacuate
     all its ships back to a planet in its original quadrant.
     """
-    if not PARENT_ENABLED:
+    if not PARENT_ENABLED or world.step < PARENT_START_TURN:
         return
     parent_ids = {p.id for p in _select_parents(world)}
     for src in world.my_planets:
@@ -4454,7 +4450,7 @@ def handle_parent_collect(world, available, spent, target_locked, moves, mode_lo
     Relay = nearest friendly planet that is closer to the parent than the source.
     This creates a cascade chain that batches ships as they flow.
     """
-    if not PARENT_ENABLED:
+    if not PARENT_ENABLED or world.step < PARENT_START_TURN:
         return
     parents = _select_parents(world)
     if not parents:
@@ -4522,7 +4518,7 @@ def handle_parent_attack(world, available, spent, target_locked, moves, mode_log
     """Parent planets attack best target. If not enough ships, send surplus
     to another parent to accumulate (parent coordination).
     """
-    if not PARENT_ENABLED:
+    if not PARENT_ENABLED or world.step < PARENT_START_TURN:
         return
     parents = _select_parents(world)
     if not parents:
@@ -4916,12 +4912,14 @@ def agent(obs, config=None):
     if not world.my_planets:
         return []
 
-    # Initialize fixed values at step 0
+    # Fix home quadrant at step 0
     if obs_step == 0 and world.my_planets:
         _starting_max_prod = max((int(p.production) for p in world.my_planets), default=1)
-        # Fix home quadrant and parents once at game start
         _home_quadrant = _get_quadrant(world.my_planets[0])
-        _parent_ids = [p.id for p in _select_parents(world)]
+
+    # Fix parents once we reach PARENT_START_TURN (when static planets are owned)
+    if PARENT_ENABLED and not _parent_ids and world.step >= PARENT_START_TURN:
+        _parent_ids = [p.id for p in _compute_parent_candidates(world)]
 
     
     if not world.is_2p:
