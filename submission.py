@@ -4542,20 +4542,27 @@ def handle_parent_attack(world, available, spent, target_locked, moves, mode_log
                        and is_targetable(world, p)
                        and not friendly_already_committed(world, p.id)]
 
-        # Sort: nearby attackable first, then by score
-        attackable = [t for t in all_targets if int(t.ships) + 1 <= avail - GARRISON_TARGET]
-        attackable.sort(key=lambda p: -_score_target(parent, p, world))
+        surplus = avail - GARRISON_TARGET
+
+        # Sort: nearest in frontier direction first, then by score
+        my_q = _get_quadrant(parent)
+        frontier_q = _frontier_quadrant(my_q, world.ang_vel)
+        attackable = [t for t in all_targets if int(t.ships) + 1 <= surplus]
+        attackable.sort(key=lambda p: (
+            0 if _get_quadrant(p) == frontier_q else 1,  # frontier targets first
+            -_score_target(parent, p, world)
+        ))
 
         attacked = False
         for tgt in attackable:
-            need = int(tgt.ships) + 1
-            aim = aim_at_target(parent, tgt, need, world.initial_by_id,
+            # Send ALL surplus (shooting star style: overwhelming force)
+            aim = aim_at_target(parent, tgt, surplus, world.initial_by_id,
                                 world.ang_vel, world=world, check_approach=True)
             if aim is None:
                 continue
             angle, turns = aim
             _commit_fleet(world, moves, spent, target_locked,
-                          parent.id, tgt.id, angle, turns, int(need))
+                          parent.id, tgt.id, angle, turns, int(surplus))
             mode_log[parent.id] = "parent-attack"
             attacked = True
             break
@@ -4822,34 +4829,49 @@ def handle_reinforce_surplus(world, available, spent, target_locked, moves, mode
 
 
 def handle_home_reinforce(world, available, spent, target_locked, moves, mode_log):
-    """Evacuate rotating planets that have drifted out of the fixed home quadrant.
-    The home quadrant (_home_quadrant) is fixed at game start.
-    Uses initial_by_id to detect which planets STARTED in home quadrant.
+    """Evacuate ALL our planets outside home quadrant (and not in frontier quadrant)
+    back to the nearest home planet or parent.
     """
     if _home_quadrant is None:
         return
 
+    parents = _select_parents(world)
+    parent_ids = {p.id for p in parents}
+
+    # Destinations: home quadrant planets (prefer parents)
     home_planets = [p for p in world.my_planets
                     if _get_quadrant(p) == _home_quadrant]
     if not home_planets:
         return
 
+    # Frontier quadrant planets are allowed to stay (they attack)
+    frontier_qs = set()
+    for p in parents:
+        frontier_qs.add(_frontier_quadrant(_get_quadrant(p), world.ang_vel))
+
     for src in world.my_planets:
-        if _get_quadrant(src) == _home_quadrant:
-            continue  # already in home quadrant
-        # Check if this planet STARTED in home quadrant (rotating planet that drifted)
-        init = world.initial_by_id.get(src.id)
-        if init is None:
-            continue
-        if _get_quadrant_from_pos(init.x, init.y) != _home_quadrant:
-            continue  # started in different quadrant, not our territory
+        src_q = _get_quadrant(src)
+        if src_q == _home_quadrant:
+            continue  # already home
+        if src_q in frontier_qs:
+            continue  # frontier planets stay for attack
+        if src.id in parent_ids:
+            continue  # parents handled separately
         if mode_log.get(src.id) in ("defended-by-solo", "defended-by-coalition",
                                     "doom-evac-launched", "comet-evac"):
             continue
         avail = available[src.id] - spent[src.id]
         if avail <= 0:
             continue
-        target = min(home_planets, key=lambda p: dist(src.x, src.y, p.x, p.y))
+        # Prefer sending to nearest parent, fall back to nearest home planet
+        dst_candidates = sorted(
+            [p for p in home_planets if p.id not in target_locked],
+            key=lambda p: (0 if p.id in parent_ids else 1,
+                           dist(src.x, src.y, p.x, p.y))
+        )
+        if not dst_candidates:
+            continue
+        target = dst_candidates[0]
         if target.id == src.id:
             continue
         aim = aim_at_target(src, target, avail, world.initial_by_id,
@@ -4857,12 +4879,11 @@ def handle_home_reinforce(world, available, spent, target_locked, moves, mode_lo
         if aim is None:
             continue
         angle, turns = aim
-        if turns > SEGMENT_MAX_TURNS:
+        if turns > SEGMENT_MAX_TURNS * 2:  # allow longer for evac
             continue
         _commit_fleet(world, moves, spent, target_locked,
                       src.id, target.id, angle, turns, int(avail))
         mode_log[src.id] = "home-evac"
-        mode_log[target.id] = "home-receive"
 
 
 
