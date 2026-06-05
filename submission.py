@@ -162,6 +162,7 @@ FWD_STAB_HORIZON = 15
 GARRISON_TARGET = 10           # keep each planet at this many ships
 SEGMENT_MAX_TURNS = 10         # never fire if arrival takes more than this many turns
 EARLY_GAME_TURNS = 50          # aggressive early phase: fire when garrison > 5
+HOME_SWEEP_TURN = 30           # start capturing all territory planets after this turn
 EARLY_MIN_SHIPS = 5            # minimum fleet size in early game
 HOME_RETURN_DIST_2P = 35.0     # send ships home if farther than this (2P)
 HOME_RETURN_DIST_4P = 22.0     # send ships home if farther than this (4P)
@@ -4173,20 +4174,18 @@ def handle_waypoint_capture(world, available, spent, target_locked, moves, mode_
 
 
 def handle_home_sweep(world, available, spent, target_locked, moves, mode_log):
-    """After EARLY_GAME_TURNS: capture ALL non-friendly planets inside home zone."""
-    if world.step < EARLY_GAME_TURNS:
+    """After HOME_SWEEP_TURN (30): capture ALL non-friendly planets inside home quadrant."""
+    if world.step < HOME_SWEEP_TURN:
         return
-    if world.home_center is None:
+    if _home_quadrant is None:
         return
-    hx, hy = world.home_center
-    dist_limit = HOME_RETURN_DIST_2P if world.is_2p else HOME_RETURN_DIST_4P
 
     home_targets = sorted(
         [p for p in world.planets
          if p.owner != world.player
          and p.id not in target_locked
          and is_targetable(world, p)
-         and dist(p.x, p.y, hx, hy) <= dist_limit],
+         and _get_quadrant(p) == _home_quadrant],
         key=lambda p: int(p.ships)  # easiest first
     )
     for tgt in home_targets:
@@ -4568,10 +4567,13 @@ def handle_parent_attack(world, available, spent, target_locked, moves, mode_log
             continue
 
         # Can't attack: try pooling with another parent
+        # Only pool with other parents that are in frontier direction and have room
+        frontier_q = _frontier_quadrant(_get_quadrant(parent), world.ang_vel)
         other_parents = [p for p in parents
                          if p.id != parent.id
                          and p.id not in target_locked
-                         and not mode_log.get(p.id)]
+                         and not mode_log.get(p.id)
+                         and _get_quadrant(p) == frontier_q]
         pooled = False
         for dst in sorted(other_parents,
                           key=lambda p: dist(parent.x, parent.y, p.x, p.y)):
@@ -4589,14 +4591,19 @@ def handle_parent_attack(world, available, spent, target_locked, moves, mode_log
             break
 
         if not pooled:
-            # No target, no pool partner: send surplus to frontier
-            frontier_q = _frontier_quadrant(_get_quadrant(parent), world.ang_vel)
-            frontier_planets = sorted(
-                [p for p in world.my_planets
-                 if _get_quadrant(p) == frontier_q and p.id not in target_locked],
-                key=lambda p: dist(parent.x, parent.y, p.x, p.y)
-            )
-            for fp in frontier_planets:
+            # No target, no pool: send to frontier of ALL occupied quadrants
+            all_frontier = []
+            occupied_qs = set(_get_quadrant(p) for p in world.my_planets)
+            for oq in occupied_qs:
+                fq = _frontier_quadrant(oq, world.ang_vel)
+                all_frontier.extend([
+                    p for p in world.my_planets
+                    if _get_quadrant(p) == fq
+                    and p.id not in target_locked
+                    and available[p.id] - spent[p.id] < GARRISON_TARGET * 2
+                ])
+            all_frontier.sort(key=lambda p: dist(parent.x, parent.y, p.x, p.y))
+            for fp in all_frontier:
                 aim = aim_at_target(parent, fp, surplus, world.initial_by_id,
                                     world.ang_vel, world=world)
                 if aim is None:
