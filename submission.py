@@ -166,6 +166,10 @@ EARLY_MIN_SHIPS = 5            # minimum fleet size in early game
 HOME_RETURN_DIST_2P = 35.0     # send ships home if farther than this (2P)
 HOME_RETURN_DIST_4P = 22.0     # send ships home if farther than this (4P)
 ENEMY_ASSAULT_RATIO = 1.5      # launch all-out attack when we have this multiple of enemy garrison
+OCCUPIED_THRESHOLD = 0.8       # 80% of planets owned = "occupied territory"
+OCCUPIED_TURN = 100            # activate occupied distribution after this turn
+# Opposite quadrant map: SE↔NW, NE↔SW
+_OPPOSITE_Q = {3: 0, 0: 3, 2: 1, 1: 2}
 
 F3_THREE_BUCKET_ENABLED = True
 F3_SAFE_FLOOR = MIN_DISPATCH_SHIPS
@@ -4269,6 +4273,9 @@ def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
             key=lambda p: -_score_target(src, p, world)
         )
         for tgt in candidates:
+            # Don't fire if a sufficient fleet is already in flight to this target
+            if friendly_already_committed(world, tgt.id):
+                continue
             min_send = EARLY_MIN_SHIPS if is_early else MIN_DISPATCH_SHIPS
             send = max(min_send, min(int(tgt.ships) + 1, ATTACK_MAX_SHIPS))
             keep = EARLY_MIN_SHIPS if is_early else GARRISON_TARGET
@@ -4283,6 +4290,74 @@ def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
                           src.id, tgt.id, angle, turns, int(send))
             mode_log[src.id] = "steady-fire"
             break
+
+
+def handle_occupied_distribute(world, available, spent, target_locked, moves, mode_log):
+    """When 80%+ of planets are ours and after turn 100:
+    middle-territory surplus -> 80% to frontier, 20% to back edge.
+    """
+    if world.step < OCCUPIED_TURN:
+        return
+    if not world.planets:
+        return
+    if len(world.my_planets) / len(world.planets) < OCCUPIED_THRESHOLD:
+        return
+    if world.home_center is None:
+        return
+
+    hx, hy = world.home_center
+    home_q = _get_quadrant_from_pos(hx, hy)
+    frontier_q = _frontier_quadrant(home_q, world.ang_vel)
+    back_q = _OPPOSITE_Q.get(frontier_q, frontier_q)
+
+    frontier_planets = [p for p in world.my_planets if _get_quadrant(p) == frontier_q]
+    back_planets = [p for p in world.my_planets if _get_quadrant(p) == back_q]
+
+    for src in world.my_planets:
+        if mode_log.get(src.id):
+            continue
+        src_q = _get_quadrant(src)
+        if src_q == frontier_q:
+            continue  # frontier planets don't redistribute
+        avail = available[src.id] - spent[src.id]
+        surplus = avail - GARRISON_TARGET
+        if surplus < MIN_DISPATCH_SHIPS:
+            continue
+
+        send_front = int(surplus * 0.8)
+        send_back = surplus - send_front
+
+        # 80% to frontier
+        if send_front >= MIN_DISPATCH_SHIPS and frontier_planets:
+            dst = min(frontier_planets, key=lambda p: dist(src.x, src.y, p.x, p.y))
+            aim = aim_at_target(src, dst, send_front, world.initial_by_id,
+                                world.ang_vel, world=world)
+            if aim is not None:
+                angle, turns = aim
+                if turns <= SEGMENT_MAX_TURNS * 2:
+                    _commit_fleet(world, moves, spent, target_locked,
+                                  src.id, dst.id, angle, turns, int(send_front))
+                    mode_log[src.id] = "occupy-front"
+
+        # 20% to back edge
+        if send_back >= MIN_DISPATCH_SHIPS and back_planets:
+            dst = min(back_planets, key=lambda p: dist(src.x, src.y, p.x, p.y))
+            aim = aim_at_target(src, dst, send_back, world.initial_by_id,
+                                world.ang_vel, world=world)
+            if aim is not None:
+                angle, turns = aim
+                if turns <= SEGMENT_MAX_TURNS * 2:
+                    _commit_fleet(world, moves, spent, target_locked,
+                                  src.id, dst.id, angle, turns, int(send_back))
+                    if not mode_log.get(src.id):
+                        mode_log[src.id] = "occupy-back"
+
+
+def _get_quadrant_from_pos(x, y):
+    """Return quadrant 0-3 for a given (x,y) position."""
+    x_half = 1 if x >= CENTER_X else 0
+    y_half = 1 if y >= CENTER_Y else 0
+    return x_half * 2 + y_half
 
 
 def handle_enemy_assault(world, available, spent, target_locked, moves, mode_log):
@@ -4399,6 +4474,8 @@ def plan_moves(world, deadline=None):
         handle_frontier_reinforce(world, available, spent, target_locked, moves, mode_log)
     if not _over_budget():
         handle_waypoint_capture(world, available, spent, target_locked, moves, mode_log)
+    if not _over_budget():
+        handle_occupied_distribute(world, available, spent, target_locked, moves, mode_log)
     if not _over_budget():
         handle_enemy_assault(world, available, spent, target_locked, moves, mode_log)
 
