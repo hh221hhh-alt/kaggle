@@ -4344,7 +4344,7 @@ def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
             if not is_early:
                 break
 
-        # Early game: no target found and ships piling up -> push to frontier
+        # Early game: no target found and >10 ships -> ALWAYS push to frontier
         if is_early and not mode_log.get(src.id):
             avail = available[src.id] - spent[src.id]
             if avail > GARRISON_TARGET:
@@ -4356,6 +4356,8 @@ def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
                      and p.id not in target_locked],
                     key=lambda p: dist(src.x, src.y, p.x, p.y)
                 )
+                # First try within distance limit
+                sent = False
                 for fp in frontier_planets:
                     aim = aim_at_target(src, fp, avail, world.initial_by_id,
                                         world.ang_vel, world=world)
@@ -4367,7 +4369,21 @@ def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
                     _commit_fleet(world, moves, spent, target_locked,
                                   src.id, fp.id, angle, turns, int(avail))
                     mode_log[src.id] = "early-to-frontier"
+                    sent = True
                     break
+                # Must send: no nearby frontier planet -> send anyway (no limit)
+                if not sent:
+                    for fp in frontier_planets:
+                        aim = aim_at_target(src, fp, avail, world.initial_by_id,
+                                            world.ang_vel, world=world)
+                        if aim is None:
+                            continue
+                        angle, turns = aim
+                        _commit_fleet(world, moves, spent, target_locked,
+                                      src.id, fp.id, angle, turns, int(avail),
+                                      allow_long=True)
+                        mode_log[src.id] = "early-to-frontier"
+                        break
 
         # Track idle streak. If no target for 3+ turns, capture the best target
         # with NO distance limit (nearest, low garrison, high production).
