@@ -167,6 +167,8 @@ EARLY_MIN_SHIPS = 5            # minimum fleet size in early game
 HOME_RETURN_DIST_2P = 35.0     # send ships home if farther than this (2P)
 HOME_RETURN_DIST_4P = 22.0     # send ships home if farther than this (4P)
 ENEMY_ASSAULT_RATIO = 1.5      # launch all-out attack when we have this multiple of enemy garrison
+THREAT_RATIO = 1.2             # planet is "threatened" if incoming enemy > defense * this
+ROI_MIN_PROD = 1              # skip capturing a target whose production is below this (late only)
 COLLECTOR_ENABLED = False      # set True to re-enable collector fleet strategy
 PARENT_ENABLED = True          # parent planet strategy
 PARENT_START_TURN = 50         # parent strategy activates after this turn
@@ -3912,6 +3914,46 @@ def _frontier_quadrant(q, ang_vel):
     return _CW_NEXT[q] if ang_vel < 0 else _CCW_NEXT[q]
 
 
+def _incoming_enemy(world, planet_id):
+    """Total hostile ships currently inbound to this planet."""
+    return sum(
+        int(ships) for eta, owner, ships in world.arrivals_by_planet.get(planet_id, [])
+        if owner != world.player and owner != -1 and ships > 0
+    )
+
+
+def _safe_reserve(world, planet):
+    """Ships to keep so the planet survives incoming enemy fleets.
+    = incoming enemy total + 1 (0 if no threat). Replaces the fixed '10'.
+    """
+    inc = _incoming_enemy(world, planet.id)
+    return inc + 1 if inc > 0 else 0
+
+
+def _threatened_planets(world):
+    """Our planets where incoming enemy > defense * THREAT_RATIO.
+    Defense = current garrison (+ a little production buffer)."""
+    out = []
+    for p in world.my_planets:
+        inc = _incoming_enemy(world, p.id)
+        if inc <= 0:
+            continue
+        defense = int(p.ships) + int(p.production) * 2
+        if inc > defense * THREAT_RATIO:
+            out.append(p)
+    return out
+
+
+def _roi_ok(world, target, turns):
+    """Late game only: skip neutral targets whose production is too low to be
+    worth the ships (production over remaining turns must beat the cost)."""
+    if world.step < EARLY_GAME_TURNS:
+        return True
+    if target.owner != -1:
+        return True  # enemy targets always worth it
+    return int(target.production) >= ROI_MIN_PROD
+
+
 def _build_circuit(planets, world):
     """Build a greedy nearest-neighbor tour through the given planets.
     Returns list of planet IDs.
@@ -4385,20 +4427,22 @@ def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
             # Don't fire if a sufficient fleet is already in flight to this target
             if friendly_already_committed(world, tgt.id):
                 continue
+            # safe_drain: keep only enough to survive incoming enemy (not fixed 10)
+            keep = _safe_reserve(world, src)
             if is_early:
-                # Early game: send exactly what's needed (no cap), keep nothing
                 min_send = EARLY_MIN_SHIPS
                 send = max(min_send, int(tgt.ships) + 1)
-                keep = 0
             else:
                 min_send = MIN_DISPATCH_SHIPS
                 send = max(min_send, min(int(tgt.ships) + 1, ATTACK_MAX_SHIPS))
-                keep = GARRISON_TARGET
             avail = available[src.id] - spent[src.id]
             if avail < send + keep:
                 if is_early:
                     continue  # try a cheaper target
                 break
+            # ROI gate (late game): skip low-value neutral grabs
+            if not _roi_ok(world, tgt, 1):
+                continue
             aim = aim_at_target(src, tgt, send, world.initial_by_id,
                                 world.ang_vel, world=world, check_approach=True)
             if aim is None:
@@ -8702,28 +8746,40 @@ def o__build_multiprong_attack(world, target, available, spent, target_locked):
 
 
 def o_handle_flow_to_frontier(world, available, spent, target_locked, moves, mode_log):
-    """Our addition: each planet keeps 10 and sends surplus toward the frontier
-    quadrant, relaying through closer friendly planets (unlimited distance).
+    """Hybrid regroup (attack-leaning): each planet keeps a safe reserve and
+    sends surplus toward (a) a threatened friendly planet if any exist, else
+    (b) the frontier quadrant. Relays through closer friendly planets.
     Runs before the old bot's attack handlers (option B)."""
     if _home_quadrant is None:
         return
     frontier_q = _frontier_quadrant(_home_quadrant, world.ang_vel)
     frontier_planets = [p for p in world.my_planets if _get_quadrant(p) == frontier_q]
-    if not frontier_planets:
-        return
-    KEEP = 10
+
+    # Threat-first (defense). If any of our planets is under real threat, surplus
+    # goes to reinforce the most threatened one instead of pushing frontier.
+    threatened = _threatened_planets(world)
+
     for src in sorted(world.my_planets,
                       key=lambda p: -(available[p.id] - spent[p.id])):
         if mode_log.get(src.id):
             continue
-        if _get_quadrant(src) == frontier_q:
-            continue  # frontier planets attack, don't flow
+        keep = _safe_reserve(world, src)
         avail = available[src.id] - spent[src.id]
-        if avail - KEEP < KEEP:  # need >20 to send a >=10 chunk and keep 10
+        surplus = avail - keep
+        if surplus < MIN_DISPATCH_SHIPS:
             continue
-        surplus = avail - KEEP
-        # Destination: nearest frontier-quadrant friendly planet
-        dest = min(frontier_planets, key=lambda p: dist(src.x, src.y, p.x, p.y))
+
+        # Choose destination set: threatened planets (defense) or frontier (attack)
+        if threatened:
+            dest_pool = [p for p in threatened if p.id != src.id]
+        else:
+            if _get_quadrant(src) == frontier_q:
+                continue  # frontier planets attack, don't flow
+            dest_pool = [p for p in frontier_planets if p.id != src.id]
+        if not dest_pool:
+            continue
+
+        dest = min(dest_pool, key=lambda p: dist(src.x, src.y, p.x, p.y))
         dest_d = dist(src.x, src.y, dest.x, dest.y)
         # Relay: nearest friendly strictly closer to dest than src (else dest)
         relay = None
