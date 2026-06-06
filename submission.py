@@ -4409,18 +4409,15 @@ def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
             if not is_early:
                 break
 
-        # Idle tracking: if a planet fired this turn reset its streak.
-        # After 2 idle turns with surplus, go capture the best target with NO
-        # distance limit; if none capturable, send all ships to the frontier.
-        # Disabled before turn 50 (pure land-grab phase).
-        if world.step < 50:
-            continue
+        # Only planets with NO target this turn proceed (those that fired skip).
+        # Before turn 50: act immediately (no wait).
+        # From turn 50: wait 2 idle turns before the long-capture / frontier push.
         if mode_log.get(src.id):
             _idle_streak[src.id] = 0
             continue
 
         _idle_streak[src.id] = _idle_streak.get(src.id, 0) + 1
-        if _idle_streak[src.id] < 2:
+        if world.step >= 50 and _idle_streak[src.id] < 2:
             continue
 
         avail = available[src.id] - spent[src.id]
