@@ -3354,11 +3354,20 @@ def _score_target(src, tgt, world):
     max_garrison = max(1, ATTACK_MAX_SHIPS - 1)
     cost_score = max(0.0, 10.0 * (1.0 - garrison / max_garrison))
 
-    # Early game weighting: distance x4, production x3, cost(low garrison) x4
-    if world.step < EARLY_GAME_TURNS:
-        return dist_score * 4 + prod_score * 3 + cost_score * 4
+    # --- 4. Direction score (0-10): against rotation flow = better ---
+    init = world.initial_by_id.get(tgt.id)
+    if init is not None and _init_is_static(init):
+        dir_score = 10.0  # static: no chasing concern
+    elif is_in_approaching_direction(src, tgt, world.ang_vel):
+        dir_score = 10.0  # approaching (against flow): good
+    else:
+        dir_score = 0.0   # would chase the target
 
-    return dist_score + prod_score + cost_score
+    # Early game weighting: distance x4, production x3, cost x4, direction x4
+    if world.step < EARLY_GAME_TURNS:
+        return dist_score * 4 + prod_score * 3 + cost_score * 4 + dir_score * 4
+
+    return dist_score + prod_score + cost_score + dir_score
 
 
 def _counter_snipe_candidates(world, src, max_travel, target_locked):
@@ -4235,6 +4244,60 @@ def handle_home_sweep(world, available, spent, target_locked, moves, mode_log):
             break
 
 
+def handle_home_defense(world, available, spent, target_locked, moves, mode_log):
+    """Watch incoming hostile fleets on home-quadrant planets. If a home planet
+    is predicted to be captured, reinforce it from the nearest home planet so
+    it survives.
+    """
+    if _home_quadrant is None:
+        return
+    home_planets = [p for p in world.my_planets
+                    if _get_quadrant(p) == _home_quadrant]
+    if len(home_planets) < 2:
+        return
+
+    for victim in home_planets:
+        if victim.id in target_locked:
+            continue
+        arrivals = world.arrivals_by_planet.get(victim.id, [])
+        # Earliest hostile arrival and the total hostile force by then
+        hostile = sorted(
+            [(eta, ships) for eta, owner, ships in arrivals
+             if owner != world.player and owner != -1 and ships > 0],
+            key=lambda x: x[0],
+        )
+        if not hostile:
+            continue
+        # Predict defender at the last hostile arrival; if we lose it, reinforce
+        last_eta = hostile[-1][0]
+        owner_at, ships_at = predict_defender_at_arrival(world, victim, last_eta)
+        if owner_at == world.player:
+            continue  # holds on its own
+
+        deficit = int(ships_at) + 1  # ships needed to flip it back / hold
+        # Reinforce from nearest home planet with surplus
+        for src in sorted(home_planets,
+                          key=lambda p: dist(p.x, p.y, victim.x, victim.y)):
+            if src.id == victim.id or mode_log.get(src.id):
+                continue
+            avail = available[src.id] - spent[src.id]
+            send = max(MIN_DISPATCH_SHIPS, deficit)
+            if avail < send:
+                continue
+            aim = aim_at_target(src, victim, send, world.initial_by_id,
+                                world.ang_vel, world=world)
+            if aim is None:
+                continue
+            angle, turns = aim
+            if turns > last_eta:
+                continue  # too slow to help
+            _commit_fleet(world, moves, spent, target_locked,
+                          src.id, victim.id, angle, turns, int(send))
+            mode_log[src.id] = "home-defense"
+            mode_log[victim.id] = "home-defended"
+            break
+
+
 def handle_home_attack(world, available, spent, target_locked, moves, mode_log):
     """Attack enemy planets inside our home zone with priority."""
     if world.home_center is None or not world.enemy_planets:
@@ -4859,6 +4922,8 @@ def plan_moves(world, deadline=None):
     handle_comet_evac(world, available, spent, target_locked, moves, mode_log)
     handle_defense(world, rescue_needs, available, spent, target_locked, moves, mode_log)
 
+    if not _over_budget():
+        handle_home_defense(world, available, spent, target_locked, moves, mode_log)
     if not _over_budget():
         handle_home_sweep(world, available, spent, target_locked, moves, mode_log)
     if not _over_budget():
