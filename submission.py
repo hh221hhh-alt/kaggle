@@ -161,7 +161,7 @@ FWD_STAB_HORIZON = 15
 
 GARRISON_TARGET = 10           # keep each planet at this many ships
 SEGMENT_MAX_TURNS = 10         # never fire if arrival takes more than this many turns
-EARLY_GAME_TURNS = 50          # aggressive early phase: fire when garrison > 5
+EARLY_GAME_TURNS = 100         # aggressive early phase: fire when garrison > 5
 HOME_SWEEP_TURN = 30           # start capturing all territory planets after this turn
 EARLY_MIN_SHIPS = 5            # minimum fleet size in early game
 HOME_RETURN_DIST_2P = 35.0     # send ships home if farther than this (2P)
