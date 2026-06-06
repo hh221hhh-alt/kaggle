@@ -2614,7 +2614,12 @@ def _commit_fleet(world, moves, spent, target_locked,
                          _init_is_static(init))
             in_home = (_home_quadrant is not None and
                        _get_quadrant(tgt_obj) == _home_quadrant)
-            if not (is_static and in_home):
+            # Early game: planets OUTSIDE home quadrant fire locally with no
+            # direction check (drifted/expansion planets clean up surroundings).
+            src_out_of_home = (_home_quadrant is not None and
+                               _get_quadrant(src_obj) != _home_quadrant)
+            early_drifter = (world.step < EARLY_GAME_TURNS and src_out_of_home)
+            if not (is_static and in_home) and not early_drifter:
                 if not is_in_approaching_direction(src_obj, tgt_obj, world.ang_vel):
                     return
     moves.append([src_id, float(angle), int(ships)])
@@ -4293,13 +4298,13 @@ def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
             if avail <= GARRISON_TARGET * 2:  # fire when > 20
                 continue
 
-        # Find capturable targets (garrison <= ATTACK_MAX_SHIPS - 1 = 19)
+        # Capturable targets. Early game: any garrison (no cap). Else: <20.
         candidates = sorted(
             [p for p in world.planets
              if p.owner != world.player
              and p.id not in target_locked
              and is_targetable(world, p)
-             and int(p.ships) < ATTACK_MAX_SHIPS
+             and (is_early or int(p.ships) < ATTACK_MAX_SHIPS)
              and (home_clear or (hx is not None and dist(p.x, p.y, hx, hy) <= dist_limit))],
             key=lambda p: -_score_target(src, p, world)
         )
@@ -4307,9 +4312,15 @@ def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
             # Don't fire if a sufficient fleet is already in flight to this target
             if friendly_already_committed(world, tgt.id):
                 continue
-            min_send = EARLY_MIN_SHIPS if is_early else MIN_DISPATCH_SHIPS
-            send = max(min_send, min(int(tgt.ships) + 1, ATTACK_MAX_SHIPS))
-            keep = GARRISON_TARGET  # keep 10 on the planet
+            if is_early:
+                # Early game: send exactly what's needed (no cap), keep nothing
+                min_send = EARLY_MIN_SHIPS
+                send = max(min_send, int(tgt.ships) + 1)
+                keep = 0
+            else:
+                min_send = MIN_DISPATCH_SHIPS
+                send = max(min_send, min(int(tgt.ships) + 1, ATTACK_MAX_SHIPS))
+                keep = GARRISON_TARGET
             avail = available[src.id] - spent[src.id]
             if avail < send + keep:
                 if is_early:
@@ -4893,6 +4904,10 @@ def handle_home_reinforce(world, available, spent, target_locked, moves, mode_lo
             continue
         avail = available[src.id] - spent[src.id]
         if avail <= 0:
+            continue
+        # Early game: only evac BIG piles (>=20). Small production is left for
+        # steady_fire to attack nearby planets locally (no direction check).
+        if world.step < EARLY_GAME_TURNS and avail < GARRISON_TARGET * 2:
             continue
         # Send to a FIXED anchor (parent, else most-central static, else most
         # central) so two adjacent planets don't pick each other and ping-pong.
