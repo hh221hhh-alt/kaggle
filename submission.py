@@ -5318,7 +5318,7 @@ o_COUNTER_SNIPE_MAX_DELAY = 12
 
 
 o_CHEAP_PICKUP_ENABLED = os.environ.get("V124_CHEAP_PICKUP", "1") != "0"
-o_CHEAP_PICKUP_4P_ONLY = True
+o_CHEAP_PICKUP_4P_ONLY = False  # enabled in 2P too (early planet-count boost)
 o_CHEAP_PICKUP_MAX_GARRISON = 25
 
 o_CHEAP_PICKUP_MIN_PROD = int(os.environ.get("F32_CP_MIN_PROD", "2"))
@@ -7999,7 +7999,9 @@ def o__nearest_targets(src, world, K, max_travel, target_locked):
             weighted -= o_F14_4A_2P_FOCUS_DIST_BONUS
 
         # --- Territory bias (our addition) ---
-        # frontier quadrant: favor (-5); home quadrant: neutral; else: penalty (+15)
+        # frontier quadrant: favor (-5); home quadrant: neutral; else: penalty.
+        # Penalty is gentle early (+5 until turn 50) so we still grab good
+        # nearby neutrals, then ramps up (+15) to consolidate territory.
         if _home_quadrant is not None:
             tq = _get_quadrant(t)
             fq = _frontier_quadrant(_home_quadrant, world.ang_vel)
@@ -8008,7 +8010,7 @@ def o__nearest_targets(src, world, K, max_travel, target_locked):
             elif tq == _home_quadrant:
                 pass
             else:
-                weighted += 15.0
+                weighted += 5.0 if world.step < 50 else 15.0
 
         candidates.append((t, weighted, raw))
     if not candidates:
@@ -8749,7 +8751,7 @@ def o_handle_flow_to_frontier(world, available, spent, target_locked, moves, mod
     """Hybrid regroup (attack-leaning): each planet keeps a safe reserve and
     sends surplus toward (a) a threatened friendly planet if any exist, else
     (b) the frontier quadrant. Relays through closer friendly planets.
-    Runs before the old bot's attack handlers (option B)."""
+    Runs AFTER attack handlers: only planets with no target this turn flow."""
     if _home_quadrant is None:
         return
     frontier_q = _frontier_quadrant(_home_quadrant, world.ang_vel)
@@ -8849,10 +8851,6 @@ def o_plan_moves(world, deadline=None):
     o_handle_defense(world, rescue_needs, available, spent, target_locked,
                    moves, mode_log)
 
-    # Our addition: push surplus to the frontier BEFORE attacks (option B)
-    if not _over_budget():
-        o_handle_flow_to_frontier(world, available, spent, target_locked, moves, mode_log)
-
     o__brain_reserve_lead(world, available, spent, mode_log)
 
     if not _over_budget():
@@ -8874,6 +8872,11 @@ def o_plan_moves(world, deadline=None):
 
     if not _over_budget():
         o_handle_multiprong(world, available, spent, target_locked, moves, mode_log)
+
+    # Our addition: AFTER attacks — only planets that found no target this turn
+    # (no mode_log) flow surplus to frontier / reinforce a threatened planet.
+    if not _over_budget():
+        o_handle_flow_to_frontier(world, available, spent, target_locked, moves, mode_log)
 
     for p in world.my_planets:
         if mode_log.get(p.id) and "absorb" not in mode_log[p.id]:
