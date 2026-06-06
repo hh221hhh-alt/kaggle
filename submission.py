@@ -4369,14 +4369,16 @@ def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
             if avail <= GARRISON_TARGET * 2:  # fire when > 20
                 continue
 
-        # Capturable targets. Early game: any garrison (no cap). Else: <20.
+        # Capturable targets. Early game: any garrison (no cap), no home-zone
+        # restriction (grab nearest reachable; score weights distance x4).
         candidates = sorted(
             [p for p in world.planets
              if p.owner != world.player
              and p.id not in target_locked
              and is_targetable(world, p)
              and (is_early or int(p.ships) < ATTACK_MAX_SHIPS)
-             and (home_clear or (hx is not None and dist(p.x, p.y, hx, hy) <= dist_limit))],
+             and (is_early or home_clear
+                  or (hx is not None and dist(p.x, p.y, hx, hy) <= dist_limit))],
             key=lambda p: -_score_target(src, p, world)
         )
         for tgt in candidates:
