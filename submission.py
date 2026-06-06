@@ -4344,79 +4344,72 @@ def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
             if not is_early:
                 break
 
-        # Early game: no target found and >10 ships -> ALWAYS push to frontier
-        if is_early and not mode_log.get(src.id):
-            avail = available[src.id] - spent[src.id]
-            if avail > GARRISON_TARGET:
-                frontier_q = _frontier_quadrant(_get_quadrant(src), world.ang_vel)
-                frontier_planets = sorted(
-                    [p for p in world.my_planets
-                     if _get_quadrant(p) == frontier_q
-                     and p.id != src.id
-                     and p.id not in target_locked],
-                    key=lambda p: dist(src.x, src.y, p.x, p.y)
-                )
-                # First try within distance limit
-                sent = False
-                for fp in frontier_planets:
-                    aim = aim_at_target(src, fp, avail, world.initial_by_id,
-                                        world.ang_vel, world=world)
-                    if aim is None:
-                        continue
-                    angle, turns = aim
-                    if turns > SEGMENT_MAX_TURNS:
-                        continue
-                    _commit_fleet(world, moves, spent, target_locked,
-                                  src.id, fp.id, angle, turns, int(avail))
-                    mode_log[src.id] = "early-to-frontier"
-                    sent = True
-                    break
-                # Must send: no nearby frontier planet -> send anyway (no limit)
-                if not sent:
-                    for fp in frontier_planets:
-                        aim = aim_at_target(src, fp, avail, world.initial_by_id,
-                                            world.ang_vel, world=world)
-                        if aim is None:
-                            continue
-                        angle, turns = aim
-                        _commit_fleet(world, moves, spent, target_locked,
-                                      src.id, fp.id, angle, turns, int(avail),
-                                      allow_long=True)
-                        mode_log[src.id] = "early-to-frontier"
-                        break
-
-        # Track idle streak. If no target for 3+ turns, capture the best target
-        # with NO distance limit (nearest, low garrison, high production).
+        # Idle tracking: if a planet fired this turn reset its streak.
+        # After 2 idle turns with surplus, go capture the best target with NO
+        # distance limit; if none capturable, send all ships to the frontier.
         if mode_log.get(src.id):
             _idle_streak[src.id] = 0
-        else:
-            _idle_streak[src.id] = _idle_streak.get(src.id, 0) + 1
-            if _idle_streak[src.id] >= 3:
-                avail = available[src.id] - spent[src.id]
-                far_targets = sorted(
-                    [p for p in world.planets
-                     if p.owner != world.player
-                     and p.id not in target_locked
-                     and is_targetable(world, p)
-                     and not friendly_already_committed(world, p.id)
-                     and int(p.ships) + 1 <= avail],
-                    key=lambda p: -_score_target(src, p, world)
-                )
-                for tgt in far_targets:
-                    send = max(MIN_DISPATCH_SHIPS, int(tgt.ships) + 1)
-                    if avail < send:
-                        continue
-                    aim = aim_at_target(src, tgt, send, world.initial_by_id,
-                                        world.ang_vel, world=world)
-                    if aim is None:
-                        continue
-                    angle, turns = aim
-                    _commit_fleet(world, moves, spent, target_locked,
-                                  src.id, tgt.id, angle, turns, int(send),
-                                  allow_long=True)
-                    mode_log[src.id] = "idle-long-capture"
-                    _idle_streak[src.id] = 0
-                    break
+            continue
+
+        _idle_streak[src.id] = _idle_streak.get(src.id, 0) + 1
+        if _idle_streak[src.id] < 2:
+            continue
+
+        avail = available[src.id] - spent[src.id]
+        if avail <= GARRISON_TARGET:
+            continue
+
+        # 1) Capture the best-score target anywhere (no distance limit)
+        far_targets = sorted(
+            [p for p in world.planets
+             if p.owner != world.player
+             and p.id not in target_locked
+             and is_targetable(world, p)
+             and not friendly_already_committed(world, p.id)
+             and int(p.ships) + 1 <= avail],
+            key=lambda p: -_score_target(src, p, world)
+        )
+        captured = False
+        for tgt in far_targets:
+            send = max(MIN_DISPATCH_SHIPS, int(tgt.ships) + 1)
+            if avail < send:
+                continue
+            aim = aim_at_target(src, tgt, send, world.initial_by_id,
+                                world.ang_vel, world=world)
+            if aim is None:
+                continue
+            angle, turns = aim
+            _commit_fleet(world, moves, spent, target_locked,
+                          src.id, tgt.id, angle, turns, int(send),
+                          allow_long=True)
+            mode_log[src.id] = "idle-long-capture"
+            _idle_streak[src.id] = 0
+            captured = True
+            break
+        if captured:
+            continue
+
+        # 2) No capturable target -> send ALL ships toward the frontier
+        frontier_q = _frontier_quadrant(_get_quadrant(src), world.ang_vel)
+        frontier_planets = sorted(
+            [p for p in world.my_planets
+             if _get_quadrant(p) == frontier_q
+             and p.id != src.id
+             and p.id not in target_locked],
+            key=lambda p: dist(src.x, src.y, p.x, p.y)
+        )
+        for fp in frontier_planets:
+            aim = aim_at_target(src, fp, avail, world.initial_by_id,
+                                world.ang_vel, world=world)
+            if aim is None:
+                continue
+            angle, turns = aim
+            _commit_fleet(world, moves, spent, target_locked,
+                          src.id, fp.id, angle, turns, int(avail),
+                          allow_long=True)
+            mode_log[src.id] = "idle-to-frontier"
+            _idle_streak[src.id] = 0
+            break
 
 
 def handle_occupied_distribute(world, available, spent, target_locked, moves, mode_log):
