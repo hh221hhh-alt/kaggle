@@ -4338,6 +4338,31 @@ def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
             if not is_early:
                 break
 
+        # Early game: no target found and ships piling up -> push to frontier
+        if is_early and not mode_log.get(src.id):
+            avail = available[src.id] - spent[src.id]
+            if avail > GARRISON_TARGET:
+                frontier_q = _frontier_quadrant(_get_quadrant(src), world.ang_vel)
+                frontier_planets = sorted(
+                    [p for p in world.my_planets
+                     if _get_quadrant(p) == frontier_q
+                     and p.id != src.id
+                     and p.id not in target_locked],
+                    key=lambda p: dist(src.x, src.y, p.x, p.y)
+                )
+                for fp in frontier_planets:
+                    aim = aim_at_target(src, fp, avail, world.initial_by_id,
+                                        world.ang_vel, world=world)
+                    if aim is None:
+                        continue
+                    angle, turns = aim
+                    if turns > SEGMENT_MAX_TURNS:
+                        continue
+                    _commit_fleet(world, moves, spent, target_locked,
+                                  src.id, fp.id, angle, turns, int(avail))
+                    mode_log[src.id] = "early-to-frontier"
+                    break
+
 
 def handle_occupied_distribute(world, available, spent, target_locked, moves, mode_log):
     """When 80%+ of planets are ours and after turn 100:
