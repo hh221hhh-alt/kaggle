@@ -2021,6 +2021,7 @@ _game_num_players = None
 _home_quadrant = None       # fixed home quadrant (set at step 0)
 _parent_ids = []            # fixed parent planet IDs (set at step 0)
 _starting_max_prod = None   # max production of starting planets (set at step 0)
+_idle_streak = {}           # planet_id -> consecutive turns with no target
 _2p_patient_streak = 0
 _2p_prod_share_history = []
 
@@ -2590,12 +2591,14 @@ def friendly_already_committed(world, target_id):
 
 
 def _commit_fleet(world, moves, spent, target_locked,
-                  src_id, target_id, angle, turns, ships):
+                  src_id, target_id, angle, turns, ships, allow_long=False):
     """Single point of truth for firing a fleet.
     Hard rules enforced here regardless of caller:
     - Minimum MIN_DISPATCH_SHIPS ships
     - Enemy/neutral targets must be in approaching direction (not chasing)
     - Turn limit SEGMENT_MAX_TURNS for enemy/neutral targets
+    allow_long=True bypasses the turn-limit and direction check (used when a
+    planet has had no target for several turns and must reach farther).
     """
     min_ships = EARLY_MIN_SHIPS if world.step < EARLY_GAME_TURNS else MIN_DISPATCH_SHIPS
     if int(ships) < min_ships:
@@ -2603,7 +2606,7 @@ def _commit_fleet(world, moves, spent, target_locked,
     # Cap fleet at 1000 — speed maxes out there, extra ships are wasted
     ships = min(int(ships), 1000)
     tgt_obj = world.planet_by_id.get(int(target_id))
-    if tgt_obj is not None and tgt_obj.owner != world.player:
+    if tgt_obj is not None and tgt_obj.owner != world.player and not allow_long:
         if int(turns) > SEGMENT_MAX_TURNS:
             return
         src_obj = world.planet_by_id.get(int(src_id))
@@ -2621,7 +2624,8 @@ def _commit_fleet(world, moves, spent, target_locked,
             early_drifter = (world.step < EARLY_GAME_TURNS and src_out_of_home)
             # Early game (until turn 50): no direction check at all (land grab)
             first_turns = world.step < EARLY_GAME_TURNS
-            if not (is_static and in_home) and not early_drifter and not first_turns:
+            if (not (is_static and in_home) and not early_drifter
+                    and not first_turns and not allow_long):
                 if not is_in_approaching_direction(src_obj, tgt_obj, world.ang_vel):
                     return
     moves.append([src_id, float(angle), int(ships)])
@@ -4365,6 +4369,39 @@ def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
                     mode_log[src.id] = "early-to-frontier"
                     break
 
+        # Track idle streak. If no target for 3+ turns, capture the best target
+        # with NO distance limit (nearest, low garrison, high production).
+        if mode_log.get(src.id):
+            _idle_streak[src.id] = 0
+        else:
+            _idle_streak[src.id] = _idle_streak.get(src.id, 0) + 1
+            if _idle_streak[src.id] >= 3:
+                avail = available[src.id] - spent[src.id]
+                far_targets = sorted(
+                    [p for p in world.planets
+                     if p.owner != world.player
+                     and p.id not in target_locked
+                     and is_targetable(world, p)
+                     and not friendly_already_committed(world, p.id)
+                     and int(p.ships) + 1 <= avail],
+                    key=lambda p: -_score_target(src, p, world)
+                )
+                for tgt in far_targets:
+                    send = max(MIN_DISPATCH_SHIPS, int(tgt.ships) + 1)
+                    if avail < send:
+                        continue
+                    aim = aim_at_target(src, tgt, send, world.initial_by_id,
+                                        world.ang_vel, world=world)
+                    if aim is None:
+                        continue
+                    angle, turns = aim
+                    _commit_fleet(world, moves, spent, target_locked,
+                                  src.id, tgt.id, angle, turns, int(send),
+                                  allow_long=True)
+                    mode_log[src.id] = "idle-long-capture"
+                    _idle_streak[src.id] = 0
+                    break
+
 
 def handle_occupied_distribute(world, available, spent, target_locked, moves, mode_log):
     """When 80%+ of planets are ours and after turn 100:
@@ -4985,6 +5022,7 @@ def agent(obs, config=None):
         _planet_prev_owner.clear()
         _freshly_lost_planets.clear()
         _opp_profile = {}
+        _idle_streak.clear()
     _agent_step += 1
 
     start = time.perf_counter()
