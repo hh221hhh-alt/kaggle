@@ -2619,7 +2619,9 @@ def _commit_fleet(world, moves, spent, target_locked,
             src_out_of_home = (_home_quadrant is not None and
                                _get_quadrant(src_obj) != _home_quadrant)
             early_drifter = (world.step < EARLY_GAME_TURNS and src_out_of_home)
-            if not (is_static and in_home) and not early_drifter:
+            # First 10 turns: no direction check at all (pure land grab)
+            first_turns = world.step < 10
+            if not (is_static and in_home) and not early_drifter and not first_turns:
                 if not is_in_approaching_direction(src_obj, tgt_obj, world.ang_vel):
                     return
     moves.append([src_id, float(angle), int(ships)])
