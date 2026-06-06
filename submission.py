@@ -2617,14 +2617,10 @@ def _commit_fleet(world, moves, spent, target_locked,
                          _init_is_static(init))
             in_home = (_home_quadrant is not None and
                        _get_quadrant(tgt_obj) == _home_quadrant)
-            # Early game: planets OUTSIDE home quadrant fire locally with no
-            # direction check (drifted/expansion planets clean up surroundings).
-            src_out_of_home = (_home_quadrant is not None and
-                               _get_quadrant(src_obj) != _home_quadrant)
-            early_drifter = (world.step < EARLY_GAME_TURNS and src_out_of_home)
-            # Early game (until turn 50): no direction check at all (land grab)
-            first_turns = world.step < EARLY_GAME_TURNS
-            if (not (is_static and in_home) and not early_drifter
+            # Until turn 50: no direction check at all (land grab).
+            # From turn 50: direction check applies (except static-in-home / long).
+            first_turns = world.step < 50
+            if (not (is_static and in_home)
                     and not first_turns and not allow_long):
                 if not is_in_approaching_direction(src_obj, tgt_obj, world.ang_vel):
                     return
@@ -3354,14 +3350,20 @@ def _score_target(src, tgt, world):
     max_garrison = max(1, ATTACK_MAX_SHIPS - 1)
     cost_score = max(0.0, 10.0 * (1.0 - garrison / max_garrison))
 
-    # --- 4. Direction score (0-10): against rotation flow = better ---
+    # Before turn 50: no direction score (pure land grab)
+    if world.step < 50:
+        if world.step < EARLY_GAME_TURNS:
+            return dist_score * 4 + prod_score * 3 + cost_score * 4
+        return dist_score + prod_score + cost_score
+
+    # --- 4. Direction score: static 8, against-flow 10, chasing 3 ---
     init = world.initial_by_id.get(tgt.id)
     if init is not None and _init_is_static(init):
-        dir_score = 10.0  # static: no chasing concern
+        dir_score = 8.0   # static: no chasing concern
     elif is_in_approaching_direction(src, tgt, world.ang_vel):
-        dir_score = 10.0  # approaching (against flow): good
+        dir_score = 10.0  # approaching (against flow): best
     else:
-        dir_score = 0.0   # would chase the target
+        dir_score = 3.0   # would chase the target
 
     # Early game weighting: distance x4, production x3, cost x4, direction x4
     if world.step < EARLY_GAME_TURNS:
@@ -4410,6 +4412,9 @@ def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
         # Idle tracking: if a planet fired this turn reset its streak.
         # After 2 idle turns with surplus, go capture the best target with NO
         # distance limit; if none capturable, send all ships to the frontier.
+        # Disabled before turn 50 (pure land-grab phase).
+        if world.step < 50:
+            continue
         if mode_log.get(src.id):
             _idle_streak[src.id] = 0
             continue
