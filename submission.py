@@ -4404,6 +4404,18 @@ def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
             if aim is None:
                 continue
             angle, turns = aim
+            # Enemy planets grow each turn — need garrison AT ARRIVAL, not now.
+            # Only fire if we can guarantee capture; never send a partial fleet.
+            if tgt.owner != -1:
+                need_arrival = effective_needed_to_capture(tgt, turns, world)
+                if avail < need_arrival + keep:
+                    continue  # not enough to surely take it -> skip
+                send = max(send, need_arrival)
+                re_aim = aim_at_target(src, tgt, send, world.initial_by_id,
+                                       world.ang_vel, world=world, check_approach=True)
+                if re_aim is None:
+                    continue
+                angle, turns = re_aim
             _commit_fleet(world, moves, spent, target_locked,
                           src.id, tgt.id, angle, turns, int(send))
             mode_log[src.id] = "steady-fire"
@@ -4446,6 +4458,17 @@ def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
             if aim is None:
                 continue
             angle, turns = aim
+            # Enemy planets grow; need garrison at arrival. Skip if can't take.
+            if tgt.owner != -1:
+                need_arrival = effective_needed_to_capture(tgt, turns, world)
+                if avail < need_arrival:
+                    continue
+                send = max(send, need_arrival)
+                re_aim = aim_at_target(src, tgt, send, world.initial_by_id,
+                                       world.ang_vel, world=world)
+                if re_aim is None:
+                    continue
+                angle, turns = re_aim
             _commit_fleet(world, moves, spent, target_locked,
                           src.id, tgt.id, angle, turns, int(send),
                           allow_long=True)
