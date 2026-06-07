@@ -3374,7 +3374,8 @@ def _score_target(src, tgt, world):
     if world.step < EARLY_GAME_TURNS:
         return dist_score * 4 + prod_score * 3 + cost_score * 4 + dir_score * 4
 
-    return dist_score + prod_score + cost_score + dir_score
+    # Mid/late: production matters MORE than early — weight it x6.
+    return dist_score * 4 + prod_score * 6 + cost_score * 4 + dir_score * 4
 
 
 def _counter_snipe_candidates(world, src, max_travel, target_locked):
@@ -4028,7 +4029,34 @@ def _resolve_relay(world, src, tgt, ships):
     return tgt, direct  # no good relay -> direct (option B)
 
 
-def _fwd_rerank(world, src, candidates, baseline, budget):
+def _standing(world):
+    """Are we winning? Combined lead vs the strongest opponent, production-weighted.
+    Returns 'winning', 'even', or 'losing'."""
+    pid = world.player
+    def _lead(getter, total):
+        mine = getter(pid)
+        best_enemy = 0
+        for o in world.owner_production.keys():
+            if o in (-1, pid):
+                continue
+            best_enemy = max(best_enemy, getter(o))
+        return (mine - best_enemy) / max(total, 1)
+
+    total_prod = max(1, world.total_prod)
+    total_fleet = max(1, sum(world.owner_strength.values()))
+    total_planets = max(1, sum(world.owner_planet_count.values()))
+    prod_lead = _lead(lambda o: world.owner_production.get(o, 0), total_prod)
+    fleet_lead = _lead(lambda o: world.owner_strength.get(o, 0), total_fleet)
+    planet_lead = _lead(lambda o: world.owner_planet_count.get(o, 0), total_planets)
+    lead = 0.5 * prod_lead + 0.25 * fleet_lead + 0.25 * planet_lead
+    if lead > 0.10:
+        return "winning"
+    if lead < -0.10:
+        return "losing"
+    return "even"
+
+
+def _fwd_rerank(world, src, candidates, baseline, budget, gain_floor=0.0):
     """Level-2 lookahead: re-rank the top-K candidates by board forward-sim gain.
 
     For each of the top-K (by _score_target) candidates, estimate a capture and
@@ -4062,7 +4090,7 @@ def _fwd_rerank(world, src, candidates, baseline, budget):
             budget[0] -= 1
         except Exception:
             return candidates  # fall back on any incompatibility
-        if gain > 0:
+        if gain > gain_floor:
             scored.append((gain, tgt))
     scored.sort(key=lambda gt: -gt[0])
     return [t for _g, t in scored] + tail
@@ -4530,6 +4558,18 @@ def handle_frontier_concentration(world, available, spent, target_locked, moves,
     nonfront = [p for p in world.my_planets
                 if _get_quadrant(p) != fq and _get_quadrant(p) != _home_quadrant]
 
+    # Standing-aware split: losing -> push harder to the frontier (offense);
+    # winning -> keep a bit more back (defense). Late-flush -> all forward.
+    standing = _standing(world)
+    if world.remaining_steps <= 70:
+        split = 0.9
+    elif standing == "losing":
+        split = 0.85
+    elif standing == "winning":
+        split = 0.6
+    else:
+        split = FRONTIER_SPLIT
+
     for src in sorted(world.my_planets,
                       key=lambda p: -(available[p.id] - spent[p.id])):
         if mode_log.get(src.id):
@@ -4540,7 +4580,7 @@ def handle_frontier_concentration(world, available, spent, target_locked, moves,
         surplus = (available[src.id] - spent[src.id]) - keep
         if surplus < MIN_DISPATCH_SHIPS:
             continue
-        send_front = int(surplus * FRONTIER_SPLIT)
+        send_front = int(surplus * split)
         send_back = surplus - send_front
         # 70% -> frontier region (fallback to non-frontier if no frontier planet)
         if send_front >= MIN_DISPATCH_SHIPS:
@@ -4576,6 +4616,17 @@ def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
             fwd_budget = [40]  # cap total forward-sims this turn
         except Exception:
             fwd_baseline = None
+
+    # Standing-aware risk: winning -> only clearly-good captures (gain>1);
+    # losing -> take risks (gain>-2); even -> gain>0. Late-flush -> all-out.
+    late_flush = world.remaining_steps <= 70
+    standing = _standing(world)
+    if late_flush or standing == "losing":
+        gain_floor = -2.0
+    elif standing == "winning":
+        gain_floor = 1.0
+    else:
+        gain_floor = 0.0
 
     # Statuses that mean the planet must NOT launch (defending/absorbing/evacuating)
     _block = ("defense", "defended-by-solo", "defended-by-coalition",
@@ -4613,13 +4664,15 @@ def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
         )
         # Late game: re-rank top candidates by whole-board forward-sim gain
         if not is_early:
-            candidates = _fwd_rerank(world, src, candidates, fwd_baseline, fwd_budget)
+            candidates = _fwd_rerank(world, src, candidates, fwd_baseline, fwd_budget,
+                                     gain_floor=gain_floor)
         for tgt in candidates:
             # Don't fire if a sufficient fleet is already in flight to this target
             if friendly_already_committed(world, tgt.id):
                 continue
-            # safe_drain: keep only enough to survive incoming enemy (not fixed 10)
-            keep = _safe_reserve(world, src)
+            # safe_drain: keep only enough to survive incoming enemy (not fixed 10).
+            # Late-flush: keep nothing — throw everything at the enemy.
+            keep = 0 if late_flush else _safe_reserve(world, src)
             if is_early:
                 min_send = EARLY_MIN_SHIPS
                 send = max(min_send, int(tgt.ships) + 1)
