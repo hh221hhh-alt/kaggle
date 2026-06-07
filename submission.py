@@ -3915,31 +3915,49 @@ def _frontier_quadrant(q, ang_vel):
 
 
 def _incoming_enemy(world, planet_id):
-    """Total hostile ships currently inbound to this planet."""
+    """Total hostile ships currently inbound to this planet, plus the earliest
+    hostile ETA. Returns (total, earliest_eta) — earliest_eta is None if none."""
+    total = 0
+    earliest = None
+    for eta, owner, ships in world.arrivals_by_planet.get(planet_id, []):
+        if owner != world.player and owner != -1 and ships > 0:
+            total += int(ships)
+            if earliest is None or eta < earliest:
+                earliest = int(eta)
+    return total, earliest
+
+
+def _incoming_friendly(world, planet_id):
+    """Total friendly ships currently inbound to this planet."""
     return sum(
         int(ships) for eta, owner, ships in world.arrivals_by_planet.get(planet_id, [])
-        if owner != world.player and owner != -1 and ships > 0
+        if owner == world.player and ships > 0
     )
 
 
 def _safe_reserve(world, planet):
-    """Ships to keep so the planet survives incoming enemy fleets.
-    = incoming enemy total + 1 (0 if no threat). Replaces the fixed '10'.
+    """Ships to keep so the planet survives incoming enemy.
+    = enemy_in - own_production_by_first_hit - friendly_in + 1, floored at 0.
     """
-    inc = _incoming_enemy(world, planet.id)
-    return inc + 1 if inc > 0 else 0
+    enemy_in, eta = _incoming_enemy(world, planet.id)
+    if enemy_in <= 0:
+        return 0
+    prod_gain = int(planet.production) * int(eta) if eta else 0
+    friendly_in = _incoming_friendly(world, planet.id)
+    return max(0, enemy_in - prod_gain - friendly_in + 1)
 
 
 def _threatened_planets(world):
-    """Our planets where incoming enemy > defense * THREAT_RATIO.
-    Defense = current garrison (+ a little production buffer)."""
+    """Our planets where incoming enemy beats our defense (garrison + production
+    buffer + inbound friendly reinforcements) by THREAT_RATIO."""
     out = []
     for p in world.my_planets:
-        inc = _incoming_enemy(world, p.id)
-        if inc <= 0:
+        enemy_in, eta = _incoming_enemy(world, p.id)
+        if enemy_in <= 0:
             continue
-        defense = int(p.ships) + int(p.production) * 2
-        if inc > defense * THREAT_RATIO:
+        friendly_in = _incoming_friendly(world, p.id)
+        defense = int(p.ships) + int(p.production) * 2 + friendly_in
+        if enemy_in > defense * THREAT_RATIO:
             out.append(p)
     return out
 
@@ -8954,25 +8972,28 @@ def agent(obs, config=None):
         _opp_profile = {}
         _idle_streak.clear()
     _agent_step += 1
+    step_est = max(int(obs_step), _agent_step - 1)
+
+    # At step 0 only, build our World once to fix the home quadrant (needed by
+    # the territory/frontier logic the o_ pipeline reads).
+    if obs_step == 0:
+        w0 = World(obs, inferred_step=0)
+        if w0.my_planets:
+            _starting_max_prod = max((int(p.production) for p in w0.my_planets), default=1)
+            _home_quadrant = _get_quadrant(w0.my_planets[0])
+
+    # Early game: delegate to the fused o_ pipeline (builds its own World).
+    # We do NOT build our own World here — avoids a wasteful double parse/turn.
+    if step_est < MIMIC_OLD_UNTIL:
+        try:
+            return o_agent(obs, config)
+        except Exception:
+            pass  # fall through to our own logic on any error
 
     start = time.perf_counter()
     world = World(obs, inferred_step=_agent_step - 1)
     if not world.my_planets:
         return []
-
-    # Fix home quadrant at step 0 (do this even when delegating, so our own
-    # strategy has it ready when we take over at MIMIC_OLD_UNTIL).
-    if obs_step == 0 and world.my_planets:
-        _starting_max_prod = max((int(p.production) for p in world.my_planets), default=1)
-        _home_quadrant = _get_quadrant(world.my_planets[0])
-
-    # Early game: use the fused opponent-bot pipeline (o_*), now with our
-    # territory penalty + frontier flow layered in.
-    if world.step < MIMIC_OLD_UNTIL:
-        try:
-            return o_agent(obs, config)
-        except Exception:
-            pass  # fall through to our own logic on any error
 
     # Fix parents once we reach PARENT_START_TURN (when static planets are owned)
     if PARENT_ENABLED and not _parent_ids and world.step >= PARENT_START_TURN:
