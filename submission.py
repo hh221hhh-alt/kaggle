@@ -3974,6 +3974,59 @@ def _roi_ok(world, target, turns):
     return int(target.production) >= ROI_MIN_PROD
 
 
+RELAY_TRIGGER_TURNS = 5        # direct ETA above this -> try relaying
+RELAY_MAX_RATIO = 1.5          # relay only if total time <= direct * this
+
+
+def _resolve_relay(world, src, tgt, ships):
+    """Return the planet to actually fire at: either a relay (a friendly planet
+    closer to tgt that shortens each hop) or tgt itself.
+
+    Relay only when: tgt is moving (orbital), direct ETA > RELAY_TRIGGER_TURNS,
+    a friendly relay exists whose (src->relay) + (relay->tgt) <= direct * RATIO.
+    Static targets and short shots go direct. Returns (dest_planet, aim) where
+    aim is (angle, turns) for src->dest, or None if even direct is unreachable.
+    """
+    direct = aim_at_target(src, tgt, ships, world.initial_by_id,
+                           world.ang_vel, world=world, check_approach=True)
+    if direct is None:
+        return None, None
+    _, direct_eta = direct
+    # Short shot, or static target -> go direct (no accuracy gain from relay)
+    init = world.initial_by_id.get(tgt.id)
+    is_static = (init is not None and _init_is_static(init))
+    if direct_eta <= RELAY_TRIGGER_TURNS or is_static:
+        return tgt, direct
+
+    best_relay = None
+    best_total = direct_eta * RELAY_MAX_RATIO
+    for rp in world.my_planets:
+        if rp.id == src.id or rp.id == tgt.id:
+            continue
+        # relay must be meaningfully closer to the target
+        if dist(rp.x, rp.y, tgt.x, tgt.y) >= dist(src.x, src.y, tgt.x, tgt.y):
+            continue
+        a1 = aim_at_target(src, rp, ships, world.initial_by_id,
+                           world.ang_vel, world=world)
+        if a1 is None:
+            continue
+        _, eta1 = a1
+        if eta1 > RELAY_TRIGGER_TURNS:
+            continue  # first hop itself should be short
+        a2 = aim_at_target(rp, tgt, ships, world.initial_by_id,
+                           world.ang_vel, world=world)
+        if a2 is None:
+            continue
+        _, eta2 = a2
+        total = eta1 + 1 + eta2  # +1 turnaround at the relay
+        if total <= best_total:
+            best_total = total
+            best_relay = (rp, a1)
+    if best_relay is not None:
+        return best_relay[0], best_relay[1]
+    return tgt, direct  # no good relay -> direct (option B)
+
+
 def _fwd_rerank(world, src, candidates, baseline, budget):
     """Level-2 lookahead: re-rank the top-K candidates by board forward-sim gain.
 
@@ -4534,8 +4587,14 @@ def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
                 if re_aim is None:
                     continue
                 angle, turns = re_aim
+            # Relay: if the target is far (>5 turns) and moving, advance the
+            # fleet to a closer friendly planet instead (re-decided next turn).
+            dest, dest_aim = _resolve_relay(world, src, tgt, int(send))
+            if dest is None:
+                continue
+            d_angle, d_turns = dest_aim
             _commit_fleet(world, moves, spent, target_locked,
-                          src.id, tgt.id, angle, turns, int(send))
+                          src.id, dest.id, d_angle, d_turns, int(send))
             mode_log[src.id] = "steady-fire"
             # Early game: keep firing from this rich planet at more targets
             if not is_early:
