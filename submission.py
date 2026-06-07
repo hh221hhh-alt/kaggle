@@ -5587,7 +5587,7 @@ o_HAMMER_TARGET_PROD_MIN = 2
 o_HAMMER_PROD_SHARE_TRIGGER = 0.40
 o_HAMMER_OVERKILL_RATIO = 1.30
 o_HAMMER_SURROUNDED_PROMOTE_TURNS = 10
-o_HAMMER_MAX_TRAVEL = 24
+o_HAMMER_MAX_TRAVEL = O_MAX_TRAVEL_CAP  # was 24; no long-distance hammers
 o_HAMMER_ABORT_OVERRUN_RATIO = 1.329521
 o_HAMMER_PLAN_REVALIDATE_INTERVAL = 1
 o_HAMMER_MIN_PER_CONTRIBUTOR = 9
@@ -5599,7 +5599,7 @@ o_MEGA_HAMMER_ENABLED = True
 o_MEGA_HAMMER_4P_ONLY = True
 o_MEGA_HAMMER_SHIPS_MIN = 300
 o_MEGA_HAMMER_TARGET_GARRISON_MAX = 80
-o_MEGA_HAMMER_MAX_TRAVEL = 40
+o_MEGA_HAMMER_MAX_TRAVEL = O_MAX_TRAVEL_CAP  # was 40; no long-distance mega-hammers
 
 
 o_PROD_RESERVE_ENABLED = False
@@ -5642,7 +5642,7 @@ o_ACCUMULATOR_LEAD_MIN_SHIPS = 100
 o_ACCUMULATOR_LEAD_THREAT_RATIO = 0.5
 o_ACCUMULATOR_FEEDER_MIN_SURPLUS = 30
 o_ACCUMULATOR_FEEDER_KEEP_RESERVE = 30
-o_ACCUMULATOR_FEEDER_MAX_TRAVEL = 30
+o_ACCUMULATOR_FEEDER_MAX_TRAVEL = O_MAX_TRAVEL_CAP  # was 30; feed only nearby
 o_ACCUMULATOR_MAX_FEEDS_PER_TURN = 3
 
 
@@ -5673,7 +5673,7 @@ o_MULTIPRONG_REINFORCER_MIN_RATIO = 1.0
 o_MULTIPRONG_E_OVERKILL = 1.05
 
 o_MULTIPRONG_CREDIBILITY_FACTOR = 0.6
-o_MULTIPRONG_MAX_TRAVEL = 40
+o_MULTIPRONG_MAX_TRAVEL = O_MAX_TRAVEL_CAP  # was 40
 o_MULTIPRONG_MIN_PER_CONTRIBUTOR = 8
 o_MULTIPRONG_MAX_PARTICIPANTS = 3
 
@@ -7886,7 +7886,9 @@ def o_handle_expand(world, available, spent, target_locked, moves, mode_log):
         if status and status != "cheap-pickup":
             continue
 
-        candidates = o__nearest_targets(src, world, K, max_travel, target_locked)
+        # Use a wider candidate window so reachable targets aren't hidden behind
+        # a few unreachable near ones (territory bias + small K could starve it).
+        candidates = o__nearest_targets(src, world, max(K, 8), max_travel, target_locked)
         fired_solo = False
         for tgt, _approx_dist in candidates:
             if o_friendly_already_committed(world, tgt.id):
