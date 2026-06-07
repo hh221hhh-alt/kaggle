@@ -171,6 +171,7 @@ THREAT_RATIO = 1.2             # planet is "threatened" if incoming enemy > defe
 ROI_MIN_PROD = 1              # skip capturing a target whose production is below this (late only)
 FWD_LOOKAHEAD_ENABLED = True   # late game: re-rank attack targets by board forward-sim
 FWD_LOOKAHEAD_TOPK = 8        # only forward-sim the top-K candidates (cost control)
+FRONTIER_SPLIT = 0.7          # surplus: 70% to frontier region, 30% to non-frontier
 COLLECTOR_ENABLED = False      # set True to re-enable collector fleet strategy
 PARENT_ENABLED = True          # parent planet strategy
 PARENT_START_TURN = 50         # parent strategy activates after this turn
@@ -4489,6 +4490,69 @@ def handle_home_attack(world, available, spent, target_locked, moves, mode_log):
             break
 
 
+def _send_friendly_toward(world, src, pool, ships, target_locked, moves, spent, mode_log, label):
+    """Send `ships` from src toward the nearest planet in `pool`, relaying through
+    a closer friendly planet when that shortens the trip. Friendly transport, so
+    no direction/turn gates. Returns True if a fleet was committed."""
+    dests = [p for p in pool if p.id != src.id and p.id not in target_locked]
+    if not dests:
+        return False
+    dest = min(dests, key=lambda p: dist(src.x, src.y, p.x, p.y))
+    dest_d = dist(src.x, src.y, dest.x, dest.y)
+    relay = None
+    for rp in sorted(world.my_planets, key=lambda p: dist(src.x, src.y, p.x, p.y)):
+        if rp.id == src.id or rp.id in target_locked:
+            continue
+        if dist(rp.x, rp.y, dest.x, dest.y) < dest_d:
+            relay = rp
+            break
+    tgt = relay if relay is not None else dest
+    if tgt.id == src.id or tgt.id in target_locked:
+        return False
+    aim = aim_at_target(src, tgt, ships, world.initial_by_id, world.ang_vel, world=world)
+    if aim is None:
+        return False
+    angle, turns = aim
+    _commit_fleet(world, moves, spent, target_locked, src.id, tgt.id, angle, turns, int(ships))
+    mode_log[src.id] = label
+    return True
+
+
+def handle_frontier_concentration(world, available, spent, target_locked, moves, mode_log):
+    """Distribute surplus regionally: 70% toward the frontier (attack + thick
+    defense), 30% toward the non-frontier (thin defense). Inside/home planets
+    drain forward; frontier planets keep their ships (they strike/defend).
+    Replaces the old home-evacuation (no pulling back to base)."""
+    if _home_quadrant is None:
+        return
+    fq = _frontier_quadrant(_home_quadrant, world.ang_vel)
+    frontier = [p for p in world.my_planets if _get_quadrant(p) == fq]
+    nonfront = [p for p in world.my_planets
+                if _get_quadrant(p) != fq and _get_quadrant(p) != _home_quadrant]
+
+    for src in sorted(world.my_planets,
+                      key=lambda p: -(available[p.id] - spent[p.id])):
+        if mode_log.get(src.id):
+            continue
+        if _get_quadrant(src) == fq:
+            continue  # frontier planets keep ships for attack/defense
+        keep = _safe_reserve(world, src)
+        surplus = (available[src.id] - spent[src.id]) - keep
+        if surplus < MIN_DISPATCH_SHIPS:
+            continue
+        send_front = int(surplus * FRONTIER_SPLIT)
+        send_back = surplus - send_front
+        # 70% -> frontier region (fallback to non-frontier if no frontier planet)
+        if send_front >= MIN_DISPATCH_SHIPS:
+            _send_friendly_toward(world, src, frontier or nonfront, send_front,
+                                  target_locked, moves, spent, mode_log, "to-frontier")
+        # 30% -> non-frontier thin defense (fallback to frontier). Second fleet
+        # from the same planet is allowed (mode_log label doesn't block it here).
+        if send_back >= MIN_DISPATCH_SHIPS and nonfront:
+            _send_friendly_toward(world, src, nonfront, send_back,
+                                  target_locked, moves, spent, mode_log, "to-nonfrontier")
+
+
 def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
     """Fire when garrison > 20, send exactly what's needed (10-20 ships).
     In opening, prioritize nearby planets to form a cluster.
@@ -5123,43 +5187,24 @@ def plan_moves(world, deadline=None):
     def _over_budget():
         return deadline is not None and time.perf_counter() >= deadline
 
+    # --- Focused late-game pipeline (3 pieces) ---
+    # Defense: rescue doomed planets + reinforce threatened ones.
     handle_comet_evac(world, available, spent, target_locked, moves, mode_log)
     handle_defense(world, rescue_needs, available, spent, target_locked, moves, mode_log)
-
     if not _over_budget():
         handle_home_defense(world, available, spent, target_locked, moves, mode_log)
-    if not _over_budget():
-        handle_home_sweep(world, available, spent, target_locked, moves, mode_log)
-    if not _over_budget():
-        handle_home_attack(world, available, spent, target_locked, moves, mode_log)
-    if not _over_budget():
-        handle_home_reinforce(world, available, spent, target_locked, moves, mode_log)
-    if not _over_budget():
-        handle_parent_evac(world, available, spent, target_locked, moves, mode_log)
-    if not _over_budget():
-        handle_parent_collect(world, available, spent, target_locked, moves, mode_log)
-    if not _over_budget():
-        handle_parent_attack(world, available, spent, target_locked, moves, mode_log)
-    if not _over_budget():
-        handle_reinforce_surplus(world, available, spent, target_locked, moves, mode_log)
-    if COLLECTOR_ENABLED and not _over_budget():
-        handle_collector_fleets(world, available, spent, target_locked, moves, mode_log)
+
+    # Piece 2 — coordinated strike: steady_fire picks the best target by board
+    # forward-sim and (for enemies) sends enough to capture. Frontier planets are
+    # rich (fed by concentration), so this becomes the decisive concentrated blow.
     if not _over_budget():
         handle_steady_fire(world, available, spent, target_locked, moves, mode_log)
+
+    # Pieces 1+3 — frontier concentration: drain inside/back surplus forward,
+    # 70% to frontier (attack + thick defense), 30% to non-frontier (thin
+    # defense). No pulling back to base (replaces evacuation).
     if not _over_budget():
-        handle_expand(world, available, spent, target_locked, moves, mode_log)
-    if not _over_budget():
-        handle_intercept(world, available, spent, target_locked, moves, mode_log)
-    if not _over_budget():
-        handle_opportunistic_attack(world, available, spent, target_locked, moves, mode_log)
-    if not _over_budget():
-        handle_flow_to_frontier(world, available, spent, target_locked, moves, mode_log)
-    if not _over_budget():
-        handle_waypoint_capture(world, available, spent, target_locked, moves, mode_log)
-    if not _over_budget():
-        handle_occupied_distribute(world, available, spent, target_locked, moves, mode_log)
-    if not _over_budget():
-        handle_enemy_assault(world, available, spent, target_locked, moves, mode_log)
+        handle_frontier_concentration(world, available, spent, target_locked, moves, mode_log)
 
     return moves
 
