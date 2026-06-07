@@ -172,6 +172,7 @@ ROI_MIN_PROD = 1              # skip capturing a target whose production is belo
 FWD_LOOKAHEAD_ENABLED = True   # late game: re-rank attack targets by board forward-sim
 FWD_LOOKAHEAD_TOPK = 8        # only forward-sim the top-K candidates (cost control)
 FRONTIER_SPLIT = 0.7          # surplus: 70% to frontier region, 30% to non-frontier
+O_MAX_TRAVEL_CAP = 12        # early game: never launch a fleet taking more turns than this
 COLLECTOR_ENABLED = False      # set True to re-enable collector fleet strategy
 PARENT_ENABLED = True          # parent planet strategy
 PARENT_START_TURN = 50         # parent strategy activates after this turn
@@ -4555,18 +4556,6 @@ def handle_frontier_concentration(world, available, spent, target_locked, moves,
     nonfront = [p for p in world.my_planets
                 if _get_quadrant(p) != fq and _get_quadrant(p) != _home_quadrant]
 
-    # Standing-aware split: losing -> push harder to the frontier (offense);
-    # winning -> keep a bit more back (defense). Late-flush -> all forward.
-    standing = _standing(world)
-    if world.remaining_steps <= 70:
-        split = 0.9
-    elif standing == "losing":
-        split = 0.85
-    elif standing == "winning":
-        split = 0.6
-    else:
-        split = FRONTIER_SPLIT
-
     for src in sorted(world.my_planets,
                       key=lambda p: -(available[p.id] - spent[p.id])):
         if mode_log.get(src.id):
@@ -4577,17 +4566,11 @@ def handle_frontier_concentration(world, available, spent, target_locked, moves,
         surplus = (available[src.id] - spent[src.id]) - keep
         if surplus < MIN_DISPATCH_SHIPS:
             continue
-        send_front = int(surplus * split)
-        send_back = surplus - send_front
-        # 70% -> frontier region (fallback to non-frontier if no frontier planet)
-        if send_front >= MIN_DISPATCH_SHIPS:
-            _send_friendly_toward(world, src, frontier or nonfront, send_front,
-                                  target_locked, moves, spent, mode_log, "to-frontier")
-        # 30% -> non-frontier thin defense (fallback to frontier). Second fleet
-        # from the same planet is allowed (mode_log label doesn't block it here).
-        if send_back >= MIN_DISPATCH_SHIPS and nonfront:
-            _send_friendly_toward(world, src, nonfront, send_back,
-                                  target_locked, moves, spent, mode_log, "to-nonfrontier")
+        # Send the WHOLE surplus toward the frontier. Non-frontier planets are
+        # used only as relay waypoints (handled inside _send_friendly_toward),
+        # not as a proactive 30% scatter.
+        _send_friendly_toward(world, src, frontier or nonfront, surplus,
+                              target_locked, moves, spent, mode_log, "to-frontier")
 
 
 def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
@@ -6381,6 +6364,7 @@ def o_generate_step_actions(world, max_per_source=3):
             "expand_max_travel_opening", o_EXPAND_MAX_TRAVEL_OPENING)
     else:
         max_travel = world.mode_params["expand_max_travel_mid"]
+    max_travel = min(max_travel, O_MAX_TRAVEL_CAP)  # no long-distance fleets
 
     for src in world.my_planets:
         avail = max(0, int(src.ships))
@@ -7742,6 +7726,7 @@ def o_handle_cheap_pickup(world, available, spent, target_locked, moves, mode_lo
         max_travel = world.mode_params.get("expand_max_travel_opening", o_EXPAND_MAX_TRAVEL_OPENING)
     else:
         max_travel = world.mode_params["expand_max_travel_mid"]
+    max_travel = min(max_travel, O_MAX_TRAVEL_CAP)  # no long-distance fleets
 
     cheap_neutrals = [
         p for p in world.neutral_planets
@@ -7872,6 +7857,7 @@ def o_handle_expand(world, available, spent, target_locked, moves, mode_log):
     else:
         K = world.mode_params["expand_k_mid"]
         max_travel = world.mode_params["expand_max_travel_mid"]
+    max_travel = min(max_travel, O_MAX_TRAVEL_CAP)  # no long-distance fleets
 
     nonfriendly = [
         p for p in world.planets
@@ -8227,18 +8213,18 @@ def o__nearest_targets(src, world, K, max_travel, target_locked):
             weighted -= o_F14_4A_2P_FOCUS_DIST_BONUS
 
         # --- Territory bias (our addition) ---
-        # frontier quadrant: favor (-5); home quadrant: neutral; else: penalty.
-        # Penalty is gentle early (+5 until turn 50) so we still grab good
-        # nearby neutrals, then ramps up (+15) to consolidate territory.
+        # Clear our HOME quadrant first (strongest favor), then the frontier,
+        # and penalize spreading into other quadrants so we don't scatter while
+        # home still has uncaptured/enemy planets.
         if _home_quadrant is not None:
             tq = _get_quadrant(t)
             fq = _frontier_quadrant(_home_quadrant, world.ang_vel)
-            if tq == fq:
-                weighted -= 5.0
-            elif tq == _home_quadrant:
-                pass
+            if tq == _home_quadrant:
+                weighted -= 8.0   # home first
+            elif tq == fq:
+                weighted -= 3.0   # then frontier
             else:
-                weighted += 5.0 if world.step < 50 else 15.0
+                weighted += 8.0 if world.step < 50 else 15.0  # avoid scatter
 
         candidates.append((t, weighted, raw))
     if not candidates:
