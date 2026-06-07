@@ -169,6 +169,8 @@ HOME_RETURN_DIST_4P = 22.0     # send ships home if farther than this (4P)
 ENEMY_ASSAULT_RATIO = 1.5      # launch all-out attack when we have this multiple of enemy garrison
 THREAT_RATIO = 1.2             # planet is "threatened" if incoming enemy > defense * this
 ROI_MIN_PROD = 1              # skip capturing a target whose production is below this (late only)
+FWD_LOOKAHEAD_ENABLED = True   # late game: re-rank attack targets by board forward-sim
+FWD_LOOKAHEAD_TOPK = 8        # only forward-sim the top-K candidates (cost control)
 COLLECTOR_ENABLED = False      # set True to re-enable collector fleet strategy
 PARENT_ENABLED = True          # parent planet strategy
 PARENT_START_TURN = 50         # parent strategy activates after this turn
@@ -3972,6 +3974,46 @@ def _roi_ok(world, target, turns):
     return int(target.production) >= ROI_MIN_PROD
 
 
+def _fwd_rerank(world, src, candidates, baseline, budget):
+    """Level-2 lookahead: re-rank the top-K candidates by board forward-sim gain.
+
+    For each of the top-K (by _score_target) candidates, estimate a capture and
+    measure how much the whole-board projected score improves vs `baseline`.
+    Keeps only candidates with positive gain (drops captures that get retaken),
+    sorted by gain desc, then appends the untouched tail. `budget` is a mutable
+    [int] capping total forward-sims this turn. Falls back to the input order
+    on any error or exhausted budget.
+    """
+    if not FWD_LOOKAHEAD_ENABLED or baseline is None or budget[0] <= 0:
+        return candidates
+    head = candidates[:FWD_LOOKAHEAD_TOPK]
+    tail = candidates[FWD_LOOKAHEAD_TOPK:]
+    scored = []
+    for tgt in head:
+        if budget[0] <= 0:
+            scored.append((0.0, tgt))
+            continue
+        # provisional eta via a quick aim with the needed ships
+        need = effective_needed_to_capture(tgt, 1, world)
+        aim = aim_at_target(src, tgt, max(1, int(need)), world.initial_by_id,
+                            world.ang_vel, world=world)
+        if aim is None:
+            continue  # unreachable -> drop
+        _, eta = aim
+        ships = effective_needed_to_capture(tgt, int(eta), world)
+        try:
+            action = {"target_id": int(tgt.id), "arrival_turn": int(eta),
+                      "ships": int(ships)}
+            gain = o_melis_evaluate(world, our_step_action=action) - baseline
+            budget[0] -= 1
+        except Exception:
+            return candidates  # fall back on any incompatibility
+        if gain > 0:
+            scored.append((gain, tgt))
+    scored.sort(key=lambda gt: -gt[0])
+    return [t for _g, t in scored] + tail
+
+
 def _build_circuit(planets, world):
     """Build a greedy nearest-neighbor tour through the given planets.
     Returns list of planet IDs.
@@ -4407,6 +4449,17 @@ def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
 
     is_early = world.step < EARLY_GAME_TURNS
 
+    # Level-2 lookahead (late game only): baseline board score + a per-turn budget
+    # on forward-sims, computed once.
+    fwd_baseline = None
+    fwd_budget = [0]
+    if not is_early and FWD_LOOKAHEAD_ENABLED:
+        try:
+            fwd_baseline = o_melis_evaluate(world, our_step_action=None)
+            fwd_budget = [40]  # cap total forward-sims this turn
+        except Exception:
+            fwd_baseline = None
+
     # Statuses that mean the planet must NOT launch (defending/absorbing/evacuating)
     _block = ("defense", "defended-by-solo", "defended-by-coalition",
               "doom-evac-launched", "comet-evac", "home-evac")
@@ -4441,6 +4494,9 @@ def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
                   or (hx is not None and dist(p.x, p.y, hx, hy) <= dist_limit))],
             key=lambda p: -_score_target(src, p, world)
         )
+        # Late game: re-rank top candidates by whole-board forward-sim gain
+        if not is_early:
+            candidates = _fwd_rerank(world, src, candidates, fwd_baseline, fwd_budget)
         for tgt in candidates:
             # Don't fire if a sufficient fleet is already in flight to this target
             if friendly_already_committed(world, tgt.id):
