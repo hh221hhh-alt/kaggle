@@ -6328,6 +6328,41 @@ def o__depth2_penalty(world, our_action, top_opp_actions=2):
     return worst_delta
 
 
+def _o_territory_gain(world, target_id):
+    """Territory bias for the old bot's melis-based expansion: favor home and
+    frontier targets, penalize non-frontier so we don't scatter sideways."""
+    if _home_quadrant is None:
+        return 0.0
+    tp = world.planet_by_id.get(int(target_id))
+    if tp is None:
+        return 0.0
+    # Scale: o_forward_score gives +8 per production point, so these are sized
+    # in "production points" — home ~1pt favor, frontier ~0.5pt, non-frontier a
+    # ~1.25pt penalty once the land-grab is over (turn >= 50).
+    tq = _get_quadrant(tp)
+    fq = _frontier_quadrant(_home_quadrant, world.ang_vel)
+    if tq == _home_quadrant:
+        return 8.0
+    if tq == fq:
+        return 4.0
+    return -4.0 if world.step < 50 else -10.0
+
+
+def _o_territory_dist_bias(world, planet):
+    """Distance-unit territory bias (smaller = preferred). Mirrors
+    o__nearest_targets so cheap-pickup also favors home/frontier and
+    deprioritizes scattering into non-frontier quadrants."""
+    if _home_quadrant is None:
+        return 0.0
+    tq = _get_quadrant(planet)
+    fq = _frontier_quadrant(_home_quadrant, world.ang_vel)
+    if tq == _home_quadrant:
+        return -8.0
+    if tq == fq:
+        return -3.0
+    return 8.0 if world.step < 50 else 15.0
+
+
 def o_search_step_action(world, max_per_source=3, max_actions_to_eval=10,
                        use_depth2=False):
     actions = o_generate_step_actions(world, max_per_source=max_per_source)
@@ -6341,6 +6376,7 @@ def o_search_step_action(world, max_per_source=3, max_actions_to_eval=10,
         gain = act_score - baseline_score
         if apply_decay and gain > 0:
             gain *= 0.97 ** int(act["arrival_turn"])
+        gain += _o_territory_gain(world, act["target_id"])  # favor home/frontier
         act["score"] = gain
         scored.append(act)
     scored.sort(key=lambda a: (-a["score"], a.get("raw_dist", 0.0)))
@@ -7759,10 +7795,11 @@ def o_handle_cheap_pickup(world, available, spent, target_locked, moves, mode_lo
             if raw / o_MAX_SPEED > max_travel + 4:
                 continue
             eff = o__effective_target_dist(src, n, world)
+            eff += _o_territory_dist_bias(world, n)  # favor home/frontier
             candidates.append((cost, eff, n))
         if not candidates:
             continue
-        candidates.sort(key=lambda kv: (kv[0], kv[1]))
+        candidates.sort(key=lambda kv: (kv[1], kv[0]))
         for _cost, _eff, n in candidates:
             plan = o_plan_solo_capture(world, src, n, avail, max_travel)
             if plan is None:
