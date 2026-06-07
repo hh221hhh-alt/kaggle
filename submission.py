@@ -2617,17 +2617,16 @@ def _commit_fleet(world, moves, spent, target_locked,
             return
         src_obj = world.planet_by_id.get(int(src_id))
         if src_obj is not None:
-            # Static planets in home territory: no direction check
             init = world.initial_by_id.get(tgt_obj.id)
-            is_static = (init is not None and
-                         _init_is_static(init))
+            is_static = (init is not None and _init_is_static(init))
             in_home = (_home_quadrant is not None and
                        _get_quadrant(tgt_obj) == _home_quadrant)
-            # Until turn 50: no direction check at all (land grab).
-            # From turn 50: direction check applies (except static-in-home / long).
-            first_turns = world.step < 50
-            if (not (is_static and in_home)
-                    and not first_turns and not allow_long):
+            # Skip the direction check (judged at launch position) only for:
+            #  - static targets in our home territory (any time), or
+            #  - static targets during the early land-grab (before turn 50).
+            # MOVING targets are always direction-checked (no chasing), incl. early.
+            skip_dir = (is_static and in_home) or (world.step < 50 and is_static)
+            if not skip_dir:
                 if not is_in_approaching_direction(src_obj, tgt_obj, world.ang_vel):
                     return
     moves.append([src_id, float(angle), int(ships)])
