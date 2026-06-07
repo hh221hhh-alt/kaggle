@@ -3984,21 +3984,18 @@ def _resolve_relay(world, src, tgt, ships):
     """Return the planet to actually fire at: either a relay (a friendly planet
     closer to tgt that shortens each hop) or tgt itself.
 
-    Relay only when: tgt is moving (orbital), direct ETA > RELAY_TRIGGER_TURNS,
-    a friendly relay exists whose (src->relay) + (relay->tgt) <= direct * RATIO.
-    Static targets and short shots go direct. Returns (dest_planet, aim) where
-    aim is (angle, turns) for src->dest, or None if even direct is unreachable.
+    Relay when direct ETA > RELAY_TRIGGER_TURNS and a friendly relay exists whose
+    (src->relay) + 1 + (relay->tgt) <= direct * RATIO. Far targets relay even if
+    static — consolidates ships forward and keeps fleets big (=faster). Short
+    shots go direct. Returns (dest_planet, aim) for src->dest, or None.
     """
     direct = aim_at_target(src, tgt, ships, world.initial_by_id,
                            world.ang_vel, world=world, check_approach=True)
     if direct is None:
         return None, None
     _, direct_eta = direct
-    # Short shot, or static target -> go direct (no accuracy gain from relay)
-    init = world.initial_by_id.get(tgt.id)
-    is_static = (init is not None and _init_is_static(init))
-    if direct_eta <= RELAY_TRIGGER_TURNS or is_static:
-        return tgt, direct
+    if direct_eta <= RELAY_TRIGGER_TURNS:
+        return tgt, direct  # already close -> direct
 
     best_relay = None
     best_total = direct_eta * RELAY_MAX_RATIO
