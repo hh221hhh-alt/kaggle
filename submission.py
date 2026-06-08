@@ -172,6 +172,11 @@ ROI_MIN_PROD = 1              # skip capturing a target whose production is belo
 FWD_LOOKAHEAD_ENABLED = True   # late game: re-rank attack targets by board forward-sim
 FWD_LOOKAHEAD_TOPK = 8        # only forward-sim the top-K candidates (cost control)
 FRONTIER_SPLIT = 0.7          # surplus: 70% to frontier region, 30% to non-frontier
+# Concentration target: if one quadrant is taking the bulk of incoming enemy
+# fire, mass surplus there instead of the frontier. Otherwise default to frontier.
+PRESSURE_FOCUS_SHARE = 0.65      # divert from frontier only if one quadrant holds
+                                 # >=65% of all incoming enemy (clear single front)
+PRESSURE_FOCUS_MIN_SHIPS = 20    # ignore trivial total pressure (noise) -> frontier
 O_MAX_TRAVEL_CAP = 12        # early game: never launch a fleet taking more turns than this
 COLLECTOR_ENABLED = False      # set True to re-enable collector fleet strategy
 PARENT_ENABLED = True          # parent planet strategy
@@ -4553,33 +4558,63 @@ def _send_friendly_toward(world, src, pool, ships, target_locked, moves, spent, 
     return True
 
 
+def _enemy_pressure_quadrant(world):
+    """Quadrant of our planets taking the bulk of incoming enemy fire, if one
+    direction clearly dominates: top quadrant >= PRESSURE_FOCUS_SHARE of all
+    incoming enemy ships, with a minimum absolute volume so noise doesn't
+    trigger it. Else None (-> caller defaults to the frontier). The decision
+    collapses to "stay on the frontier vs divert to the attacked direction":
+    when the top quadrant is itself the frontier, the caller targets it anyway.
+    """
+    pressure = defaultdict(int)
+    total = 0
+    for p in world.my_planets:
+        enemy_in, _eta = _incoming_enemy(world, p.id)
+        if enemy_in > 0:
+            pressure[_get_quadrant(p)] += enemy_in
+            total += enemy_in
+    if total < PRESSURE_FOCUS_MIN_SHIPS or not pressure:
+        return None
+    top_q = max(pressure, key=pressure.get)
+    if pressure[top_q] >= total * PRESSURE_FOCUS_SHARE:
+        return top_q
+    return None
+
+
 def handle_frontier_concentration(world, available, spent, target_locked, moves, mode_log):
-    """Distribute surplus regionally: 70% toward the frontier (attack + thick
-    defense), 30% toward the non-frontier (thin defense). Inside/home planets
-    drain forward; frontier planets keep their ships (they strike/defend).
+    """Mass leftover surplus toward one direction. If a single quadrant is
+    taking the bulk of incoming enemy fire, concentrate there (reinforce +
+    stage a counter). Otherwise default to the frontier. Inside/home planets
+    drain forward; planets already in the target quadrant keep their ships.
     Replaces the old home-evacuation (no pulling back to base)."""
     if _home_quadrant is None:
         return
     fq = _frontier_quadrant(_home_quadrant, world.ang_vel)
-    frontier = [p for p in world.my_planets if _get_quadrant(p) == fq]
+    focus_q = _enemy_pressure_quadrant(world)
+    target_q = focus_q if focus_q is not None else fq
+    pool = [p for p in world.my_planets if _get_quadrant(p) == target_q]
+    if not pool:  # no friendly planet in the pressured quadrant -> use frontier
+        target_q = fq
+        pool = [p for p in world.my_planets if _get_quadrant(p) == target_q]
+    label = "to-pressure" if (focus_q is not None and target_q == focus_q) else "to-frontier"
+    # fallback destinations (relay waypoints) if the target pool is empty
     nonfront = [p for p in world.my_planets
-                if _get_quadrant(p) != fq and _get_quadrant(p) != _home_quadrant]
+                if _get_quadrant(p) != target_q and _get_quadrant(p) != _home_quadrant]
 
     for src in sorted(world.my_planets,
                       key=lambda p: -(available[p.id] - spent[p.id])):
         if mode_log.get(src.id):
             continue
-        if _get_quadrant(src) == fq:
-            continue  # frontier planets keep ships for attack/defense
+        if _get_quadrant(src) == target_q:
+            continue  # target-quadrant planets keep ships for attack/defense
         keep = _safe_reserve(world, src)
         surplus = (available[src.id] - spent[src.id]) - keep
         if surplus < MIN_DISPATCH_SHIPS:
             continue
-        # Send the WHOLE surplus toward the frontier. Non-frontier planets are
-        # used only as relay waypoints (handled inside _send_friendly_toward),
-        # not as a proactive 30% scatter.
-        _send_friendly_toward(world, src, frontier or nonfront, surplus,
-                              target_locked, moves, spent, mode_log, "to-frontier")
+        # Send the WHOLE surplus toward the target. Other planets are used only
+        # as relay waypoints (handled inside _send_friendly_toward).
+        _send_friendly_toward(world, src, pool or nonfront, surplus,
+                              target_locked, moves, spent, mode_log, label)
 
 
 def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
