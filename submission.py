@@ -946,16 +946,21 @@ def fleet_target_planet(fleet, planets, initial_by_id=None, ang_vel=0.0):
 
 
 def garrison_at_arrival(target, travel_turns):
-    """Defender ship count at the moment our fleet lands."""
+    """Defender ship count at the moment our fleet lands.
+    Engine truth: production is a FLOAT added every turn (garrison = ships +
+    production*turns). Flooring the rate first under-counts growth, so use floats.
+    """
     if target.owner == -1:
-        return int(target.ships)  
-    return int(target.ships) + int(target.production) * int(travel_turns)
+        return float(target.ships)  # neutrals don't grow
+    return float(target.ships) + float(target.production) * float(travel_turns)
 
 
 
 def needed_to_capture(target, travel_turns):
-    """Ships required at arrival to flip ownership (combat: survivor > garrison)."""
-    return garrison_at_arrival(target, travel_turns) + 1
+    """Ships required at arrival to flip ownership (combat needs survivor >
+    garrison strictly; engine ties go to the defender). floor(garrison)+1 is the
+    smallest integer strictly greater than the (fractional) garrison."""
+    return int(math.floor(garrison_at_arrival(target, travel_turns))) + 1
 
 
 
@@ -986,11 +991,11 @@ def effective_garrison_at_arrival(target, travel_turns, world):
     if not relevant:
         return target.owner, garrison_at_arrival(target, travel_turns)
     owner = int(target.owner)
-    ships = int(target.ships)
-    prod = max(0, int(target.production))
+    ships = float(target.ships)
+    prod = max(0.0, float(target.production))  # fractional production rate
     last_t = 0
     for eta, fleet_owner, fleet_ships in relevant:
-        
+
         if owner != -1:
             ships += prod * (eta - last_t)
         if fleet_owner == owner:
@@ -1012,9 +1017,10 @@ def effective_garrison_at_arrival(target, travel_turns, world):
 
 
 def effective_needed_to_capture(target, travel_turns, world):
-    """needed_to_capture with effective_garrison_at_arrival projection."""
+    """needed_to_capture with effective_garrison_at_arrival projection.
+    floor(garrison)+1 = smallest int strictly above the fractional garrison."""
     _, defender_ships = effective_garrison_at_arrival(target, travel_turns, world)
-    return defender_ships + 1
+    return int(math.floor(defender_ships)) + 1
 
 
 
@@ -1056,10 +1062,10 @@ def compute_planet_reserve(planet, arrivals, player):
     if planet.owner != player:
         return 0, True, 0, None
 
-    prod = max(0, int(planet.production))
+    prod = max(0.0, float(planet.production))  # fractional production rate
     ships_now = max(0, int(planet.ships))
     if prod > 0:
-        absorb_window = max(1, ships_now // prod)
+        absorb_window = max(1, int(ships_now / prod))
     else:
         absorb_window = SIM_HORIZON
 
@@ -1108,8 +1114,8 @@ def compute_planet_reserve(planet, arrivals, player):
     if not events:
         return 0, True, 0, None
 
-    growth = int(planet.production)
-    bal = int(planet.ships)
+    growth = float(planet.production)  # fractional production rate
+    bal = float(planet.ships)
     last_t = 0
     min_bal = bal
     deadline = None
@@ -1125,11 +1131,14 @@ def compute_planet_reserve(planet, arrivals, player):
 
     if min_bal >= ABSORB_PROJECTION_MARGIN:
         excess = min_bal - ABSORB_PROJECTION_MARGIN
-        reserve = max(0, int(planet.ships) - excess)
+        # reserve rounded DOWN = keep at least this many (don't over-reserve;
+        # extra excess is genuinely spare). Stay safe by flooring excess.
+        reserve = max(0, int(planet.ships) - int(math.floor(excess)))
         return reserve, True, 0, None
 
+    # Not holding: round the deficit UP so we ask for enough reinforcement.
     deficit = ABSORB_PROJECTION_MARGIN - min_bal
-    return int(planet.ships), False, int(deficit), deadline
+    return int(planet.ships), False, int(math.ceil(deficit)), deadline
 
 
 
@@ -2129,7 +2138,7 @@ def predict_defender_at_arrival(world, target, arrival_turn):
 
     for t in range(1, horizon + 1):
         if owner != -1:
-            garrison += int(target.production)
+            garrison += float(target.production)  # fractional production rate
         group = by_turn.get(t)
         if group:
             owner, garrison = _resolve_combat(owner, garrison, group)
@@ -2792,7 +2801,7 @@ def handle_defense(world, rescue_needs, available, spent, target_locked,
                     by_owner[owner] += ships
                 threat_metric = max(by_owner.values()) if by_owner else 0
             window = deadline if deadline is not None else PREEMPTIVE_EVAC_DEFAULT_WINDOW
-            garrison_at_deadline = int(victim.ships) + int(victim.production) * int(window)
+            garrison_at_deadline = float(victim.ships) + float(victim.production) * int(window)
             if threat_metric > garrison_at_deadline * PREEMPTIVE_EVAC_DOOM_RATIO:
                 if _try_doom_evac(world, victim, available, spent, target_locked, moves, mode_log):
                     continue
@@ -2957,8 +2966,8 @@ def _try_doom_evac(world, victim, available, spent, target_locked, moves, mode_l
         
         
         is_enemy = dst.owner != -1
-        prod = int(dst.production) if is_enemy else 0
-        arrival_garrison = int(dst.ships) + prod * int(turns)
+        prod = float(dst.production) if is_enemy else 0.0  # fractional rate
+        arrival_garrison = float(dst.ships) + prod * int(turns)
         required = arrival_garrison + DOOM_EVAC_ATTACK_OVERKILL
         if int(garrison) < required:
             continue
@@ -3414,9 +3423,9 @@ def _counter_snipe_candidates(world, src, max_travel, target_locked):
         delay = my_eta_est - enemy_eta
         if delay < COUNTER_SNIPE_MIN_DELAY or delay > COUNTER_SNIPE_MAX_DELAY:
             continue
-        prod = max(0, int(n.production))
+        prod = max(0.0, float(n.production))  # fractional production rate
         defender_at_my_arrival = max(0, int(enemy_remaining)) + prod * delay
-        flip_cost = defender_at_my_arrival + 1
+        flip_cost = int(math.floor(defender_at_my_arrival)) + 1
         if flip_cost > COUNTER_SNIPE_MAX_COST:
             continue
         out.append((flip_cost, n, d))
@@ -3457,9 +3466,9 @@ def _plan_counter_snipe(world, src, tgt, max_avail, max_travel):
     delay = turns - enemy_eta
     if delay < COUNTER_SNIPE_MIN_DELAY or delay > COUNTER_SNIPE_MAX_DELAY:
         return None
-    prod = max(0, int(tgt.production))
+    prod = max(0.0, float(tgt.production))  # fractional production rate
     defender = max(0, int(enemy_remaining)) + prod * delay
-    ships = max(MIN_DISPATCH_SHIPS, defender + 1)
+    ships = max(MIN_DISPATCH_SHIPS, int(math.floor(defender)) + 1)
     if ships > max_avail or ships > COUNTER_SNIPE_MAX_COST:
         return None
     aim2 = aim_at_target(src, tgt, ships, world.initial_by_id, world.ang_vel, world=world)
@@ -3472,8 +3481,8 @@ def _plan_counter_snipe(world, src, tgt, max_avail, max_travel):
     if delay2 < COUNTER_SNIPE_MIN_DELAY or delay2 > COUNTER_SNIPE_MAX_DELAY:
         return None
     defender2 = max(0, int(enemy_remaining)) + prod * delay2
-    if ships < defender2 + 1:
-        ships = defender2 + 1
+    if ships < int(math.floor(defender2)) + 1:
+        ships = int(math.floor(defender2)) + 1
         if ships > max_avail or ships > COUNTER_SNIPE_MAX_COST:
             return None
         aim3 = aim_at_target(src, tgt, ships, world.initial_by_id, world.ang_vel, world=world)
@@ -3554,7 +3563,7 @@ def _capture_holds_against_snipe(world, target, arrival_turn, ships_sent):
     if ships_sent <= pre_garrison:
         return True
     surplus = ships_sent - pre_garrison
-    prod = max(0, int(target.production))
+    prod = max(0.0, float(target.production))  # fractional production rate
     by_turn = defaultdict(int)
     for eta, ships in enemy_after:
         by_turn[eta] -= ships
@@ -3946,7 +3955,8 @@ def _safe_reserve(world, planet):
     enemy_in, eta = _incoming_enemy(world, planet.id)
     if enemy_in <= 0:
         return 0
-    prod_gain = int(planet.production) * int(eta) if eta else 0
+    # Fractional production rate; floor the gain so we never under-reserve.
+    prod_gain = int(math.floor(float(planet.production) * int(eta))) if eta else 0
     friendly_in = _incoming_friendly(world, planet.id)
     return max(0, enemy_in - prod_gain - friendly_in + 1)
 
@@ -3960,7 +3970,7 @@ def _threatened_planets(world):
         if enemy_in <= 0:
             continue
         friendly_in = _incoming_friendly(world, p.id)
-        defense = int(p.ships) + int(p.production) * 2 + friendly_in
+        defense = float(p.ships) + float(p.production) * 2 + friendly_in
         if enemy_in > defense * THREAT_RATIO:
             out.append(p)
     return out
@@ -6035,13 +6045,15 @@ def o_fleet_target_planet(fleet, planets, initial_by_id=None, ang_vel=0.0):
 
 
 def o_garrison_at_arrival(target, travel_turns):
+    # Engine truth: production is a FLOAT added each turn; don't floor the rate.
     if target.owner == -1:
-        return int(target.ships)
-    return int(target.ships) + int(target.production) * int(travel_turns)
+        return float(target.ships)
+    return float(target.ships) + float(target.production) * float(travel_turns)
 
 
 def o_needed_to_capture(target, travel_turns):
-    return o_garrison_at_arrival(target, travel_turns) + 1
+    # Capture needs survivor > garrison strictly; floor(garrison)+1 is smallest int above it.
+    return int(math.floor(o_garrison_at_arrival(target, travel_turns))) + 1
 
 
 o_EFFECTIVE_GARRISON_ENABLED = True
@@ -6067,8 +6079,8 @@ def o_effective_garrison_at_arrival(target, travel_turns, world):
     if not relevant:
         return target.owner, o_garrison_at_arrival(target, travel_turns)
     owner = int(target.owner)
-    ships = int(target.ships)
-    prod = max(0, int(target.production))
+    ships = float(target.ships)
+    prod = max(0.0, float(target.production))  # fractional production rate
     last_t = 0
     for eta, fleet_owner, fleet_ships in relevant:
         if owner != -1:
@@ -6091,7 +6103,7 @@ def o_effective_garrison_at_arrival(target, travel_turns, world):
 
 def o_effective_needed_to_capture(target, travel_turns, world):
     _, defender_ships = o_effective_garrison_at_arrival(target, travel_turns, world)
-    return defender_ships + 1
+    return int(math.floor(defender_ships)) + 1
 
 
 def o_collect_arrivals(planet_id, fleets, planets, initial_by_id=None, ang_vel=0.0):
@@ -6110,10 +6122,10 @@ def o_compute_planet_reserve(planet, arrivals, player):
     if planet.owner != player:
         return 0, True, 0, None
 
-    prod = max(0, int(planet.production))
+    prod = max(0.0, float(planet.production))  # fractional production rate
     ships_now = max(0, int(planet.ships))
     if prod > 0:
-        absorb_window = max(1, ships_now // prod)
+        absorb_window = max(1, int(ships_now / prod))
     else:
         absorb_window = o_SIM_HORIZON
 
@@ -6157,8 +6169,8 @@ def o_compute_planet_reserve(planet, arrivals, player):
     if not events:
         return 0, True, 0, None
 
-    growth = int(planet.production)
-    bal = int(planet.ships)
+    growth = float(planet.production)  # fractional production rate
+    bal = float(planet.ships)
     last_t = 0
     min_bal = bal
     deadline = None
@@ -6174,11 +6186,11 @@ def o_compute_planet_reserve(planet, arrivals, player):
 
     if min_bal >= o_ABSORB_PROJECTION_MARGIN:
         excess = min_bal - o_ABSORB_PROJECTION_MARGIN
-        reserve = max(0, int(planet.ships) - excess)
+        reserve = max(0, int(planet.ships) - int(math.floor(excess)))
         return reserve, True, 0, None
 
     deficit = o_ABSORB_PROJECTION_MARGIN - min_bal
-    return int(planet.ships), False, int(deficit), deadline
+    return int(planet.ships), False, int(math.ceil(deficit)), deadline
 
 
 def o_forward_project(world, our_capture_target=None, our_capture_turn=None,
@@ -6964,7 +6976,7 @@ def o_predict_defender_at_arrival(world, target, arrival_turn):
 
     for t in range(1, horizon + 1):
         if owner != -1:
-            garrison += int(target.production)
+            garrison += float(target.production)  # fractional production rate
         group = by_turn.get(t)
         if group:
             owner, garrison = o__resolve_combat(owner, garrison, group)
@@ -7465,7 +7477,7 @@ def o_handle_defense(world, rescue_needs, available, spent, target_locked,
                     by_owner[owner] += ships
                 threat_metric = max(by_owner.values()) if by_owner else 0
             window = deadline if deadline is not None else o_PREEMPTIVE_EVAC_DEFAULT_WINDOW
-            garrison_at_deadline = int(victim.ships) + int(victim.production) * int(window)
+            garrison_at_deadline = float(victim.ships) + float(victim.production) * int(window)
             if threat_metric > garrison_at_deadline * o_PREEMPTIVE_EVAC_DOOM_RATIO:
                 if o__try_doom_evac(world, victim, available, spent, target_locked, moves, mode_log):
                     continue
@@ -7599,8 +7611,8 @@ def o__try_doom_evac(world, victim, available, spent, target_locked, moves, mode
         if turns > o_DOOM_EVAC_MAX_TRAVEL:
             continue
         is_enemy = dst.owner != -1
-        prod = int(dst.production) if is_enemy else 0
-        arrival_garrison = int(dst.ships) + prod * int(turns)
+        prod = float(dst.production) if is_enemy else 0.0  # fractional rate
+        arrival_garrison = float(dst.ships) + prod * int(turns)
         required = arrival_garrison + o_DOOM_EVAC_ATTACK_OVERKILL
         if int(garrison) < required:
             continue
@@ -8029,9 +8041,9 @@ def o__counter_snipe_candidates(world, src, max_travel, target_locked):
         delay = my_eta_est - enemy_eta
         if delay < o_COUNTER_SNIPE_MIN_DELAY or delay > o_COUNTER_SNIPE_MAX_DELAY:
             continue
-        prod = max(0, int(n.production))
+        prod = max(0.0, float(n.production))  # fractional production rate
         defender_at_my_arrival = max(0, int(enemy_remaining)) + prod * delay
-        flip_cost = defender_at_my_arrival + 1
+        flip_cost = int(math.floor(defender_at_my_arrival)) + 1
         if flip_cost > o_COUNTER_SNIPE_MAX_COST:
             continue
         out.append((flip_cost, n, d))
@@ -8069,9 +8081,9 @@ def o__plan_counter_snipe(world, src, tgt, max_avail, max_travel):
     delay = turns - enemy_eta
     if delay < o_COUNTER_SNIPE_MIN_DELAY or delay > o_COUNTER_SNIPE_MAX_DELAY:
         return None
-    prod = max(0, int(tgt.production))
+    prod = max(0.0, float(tgt.production))  # fractional production rate
     defender = max(0, int(enemy_remaining)) + prod * delay
-    ships = max(o_MIN_DISPATCH_SHIPS, defender + 1)
+    ships = max(o_MIN_DISPATCH_SHIPS, int(math.floor(defender)) + 1)
     if ships > max_avail or ships > o_COUNTER_SNIPE_MAX_COST:
         return None
     aim2 = o_aim_at_target(src, tgt, ships, world.initial_by_id, world.ang_vel, world=world)
@@ -8084,8 +8096,8 @@ def o__plan_counter_snipe(world, src, tgt, max_avail, max_travel):
     if delay2 < o_COUNTER_SNIPE_MIN_DELAY or delay2 > o_COUNTER_SNIPE_MAX_DELAY:
         return None
     defender2 = max(0, int(enemy_remaining)) + prod * delay2
-    if ships < defender2 + 1:
-        ships = defender2 + 1
+    if ships < int(math.floor(defender2)) + 1:
+        ships = int(math.floor(defender2)) + 1
         if ships > max_avail or ships > o_COUNTER_SNIPE_MAX_COST:
             return None
         aim3 = o_aim_at_target(src, tgt, ships, world.initial_by_id, world.ang_vel, world=world)
@@ -8149,7 +8161,7 @@ def o__capture_holds_against_snipe(world, target, arrival_turn, ships_sent):
     if ships_sent <= pre_garrison:
         return True
     surplus = ships_sent - pre_garrison
-    prod = max(0, int(target.production))
+    prod = max(0.0, float(target.production))  # fractional production rate
     by_turn = defaultdict(int)
     for eta, ships in enemy_after:
         by_turn[eta] -= ships
