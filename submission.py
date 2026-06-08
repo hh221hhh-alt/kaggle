@@ -182,7 +182,7 @@ PRESSURE_FOCUS_MIN_SHIPS = 20    # ignore trivial total pressure (noise) -> fron
 REACT_FREE_TURNS = 3             # within this flight time the enemy can't react
 REACT_SCALE_TURNS = 6            # then reaction ramps to full over this many turns
 REACT_MARGIN_SHIPS = 8           # max extra ships added for a long-flight capture
-O_MAX_TRAVEL_CAP = 12        # early game: never launch a fleet taking more turns than this
+O_MAX_TRAVEL_CAP = 15        # early game: never launch a fleet taking more turns than this
 COLLECTOR_ENABLED = False      # set True to re-enable collector fleet strategy
 PARENT_ENABLED = True          # parent planet strategy
 PARENT_START_TURN = 50         # parent strategy activates after this turn
@@ -7455,6 +7455,10 @@ def o_friendly_already_committed(world, target_id):
 
 def o__commit_fleet(world, moves, spent, target_locked,
                   src_id, target_id, angle, turns, ships):
+    # Hard backstop: no early-game fleet ever flies more than O_MAX_TRAVEL_CAP
+    # turns, whatever path requested it (expand, hammer, defense, evac, ...).
+    if int(turns) > O_MAX_TRAVEL_CAP:
+        return
     moves.append([src_id, float(angle), int(ships)])
     spent[src_id] += int(ships)
     target_locked.add(target_id)
@@ -7799,7 +7803,7 @@ o_COMET_EVAC_MIN_SHIPS = 5
 
 o_DOOM_EVAC_ENABLED = True
 o_DOOM_EVAC_MIN_SHIPS = 5
-o_DOOM_EVAC_MAX_TRAVEL = 40
+o_DOOM_EVAC_MAX_TRAVEL = O_MAX_TRAVEL_CAP  # was 40; no long-distance evac flights
 
 
 o_DOOM_EVAC_ATTACK_FALLBACK_ENABLED = True
