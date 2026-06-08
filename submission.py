@@ -177,6 +177,11 @@ FRONTIER_SPLIT = 0.7          # surplus: 70% to frontier region, 30% to non-fron
 PRESSURE_FOCUS_SHARE = 0.65      # divert from frontier only if one quadrant holds
                                  # >=65% of all incoming enemy (clear single front)
 PRESSURE_FOCUS_MIN_SHIPS = 20    # ignore trivial total pressure (noise) -> frontier
+# Reaction-time capture margin: a far target gives the enemy time to reinforce,
+# so add a flight-time-scaled buffer on top of the exact capture need.
+REACT_FREE_TURNS = 3             # within this flight time the enemy can't react
+REACT_SCALE_TURNS = 6            # then reaction ramps to full over this many turns
+REACT_MARGIN_SHIPS = 8           # max extra ships added for a long-flight capture
 O_MAX_TRAVEL_CAP = 12        # early game: never launch a fleet taking more turns than this
 COLLECTOR_ENABLED = False      # set True to re-enable collector fleet strategy
 PARENT_ENABLED = True          # parent planet strategy
@@ -2785,7 +2790,11 @@ def handle_defense(world, rescue_needs, available, spent, target_locked,
     if not rescue_needs:
         return
 
-    for victim_id, (deficit, deadline, victim) in rescue_needs.items():
+    # Defend by what we'd lose, most valuable first: a high-production planet
+    # hurts most to lose, so when rescuers are scarce it gets first claim.
+    ordered = sorted(rescue_needs.items(),
+                     key=lambda kv: (-float(kv[1][2].production), -int(kv[1][2].ships)))
+    for victim_id, (deficit, deadline, victim) in ordered:
         if victim_id in target_locked:
             continue
         need = deficit + DEFENSE_OVERSEND
@@ -3968,7 +3977,9 @@ def _safe_reserve(world, planet):
 
 def _threatened_planets(world):
     """Our planets where incoming enemy beats our defense (garrison + production
-    buffer + inbound friendly reinforcements) by THREAT_RATIO."""
+    buffer + inbound friendly reinforcements) by THREAT_RATIO. Sorted by what we
+    stand to lose, most valuable first: production (a high-output planet hurts
+    most to lose), then how badly it is being overwhelmed."""
     out = []
     for p in world.my_planets:
         enemy_in, eta = _incoming_enemy(world, p.id)
@@ -3977,8 +3988,9 @@ def _threatened_planets(world):
         friendly_in = _incoming_friendly(world, p.id)
         defense = float(p.ships) + float(p.production) * 2 + friendly_in
         if enemy_in > defense * THREAT_RATIO:
-            out.append(p)
-    return out
+            out.append((p, enemy_in - defense))
+    out.sort(key=lambda pe: (-float(pe[0].production), -pe[1]))
+    return [p for p, _overshoot in out]
 
 
 def _roi_ok(world, target, turns):
@@ -4454,7 +4466,9 @@ def handle_home_defense(world, available, spent, target_locked, moves, mode_log)
     if len(home_planets) < 2:
         return
 
-    for victim in home_planets:
+    # Defend the most valuable home planet first (production, then garrison).
+    for victim in sorted(home_planets,
+                         key=lambda p: (-float(p.production), -int(p.ships))):
         if victim.id in target_locked:
             continue
         arrivals = world.arrivals_by_planet.get(victim.id, [])
@@ -4531,31 +4545,72 @@ def handle_home_attack(world, available, spent, target_locked, moves, mode_log):
 
 
 def _send_friendly_toward(world, src, pool, ships, target_locked, moves, spent, mode_log, label):
-    """Send `ships` from src toward the nearest planet in `pool`, relaying through
-    a closer friendly planet when that shortens the trip. Friendly transport, so
-    no direction/turn gates. Returns True if a fleet was committed."""
-    dests = [p for p in pool if p.id != src.id and p.id not in target_locked]
+    """Send `ships` from src toward a planet in `pool`, preferring the MOST
+    pressured (stressed) destination, relaying through a closer friendly planet
+    when that shortens the trip. Friendly transport, so no direction/turn gates.
+
+    Skips destinations that already acted this turn (don't pour into a planet
+    we're already launching from / defending) and destinations the do-nothing
+    projection shows we lose before the fleet arrives (those are handled by the
+    defense pass, not marshalling). Returns True if a fleet was committed."""
+    # idea: role mutex -- don't reinforce a planet that already acted this turn.
+    dests = [p for p in pool
+             if p.id != src.id and p.id not in target_locked
+             and not mode_log.get(p.id)]
     if not dests:
         return False
-    dest = min(dests, key=lambda p: dist(src.x, src.y, p.x, p.y))
-    dest_d = dist(src.x, src.y, dest.x, dest.y)
-    relay = None
-    for rp in sorted(world.my_planets, key=lambda p: dist(src.x, src.y, p.x, p.y)):
-        if rp.id == src.id or rp.id in target_locked:
+    # idea: pressure gradient -- most-stressed first, nearest as the tiebreak.
+    dests.sort(key=lambda p: (-_planet_pressure(world, p),
+                              dist(src.x, src.y, p.x, p.y)))
+    for dest in dests:
+        dest_d = dist(src.x, src.y, dest.x, dest.y)
+        relay = None
+        for rp in sorted(world.my_planets, key=lambda p: dist(src.x, src.y, p.x, p.y)):
+            if rp.id == src.id or rp.id in target_locked:
+                continue
+            if dist(rp.x, rp.y, dest.x, dest.y) < dest_d:
+                relay = rp
+                break
+        tgt = relay if relay is not None else dest
+        if tgt.id == src.id or tgt.id in target_locked:
             continue
-        if dist(rp.x, rp.y, dest.x, dest.y) < dest_d:
-            relay = rp
-            break
-    tgt = relay if relay is not None else dest
-    if tgt.id == src.id or tgt.id in target_locked:
-        return False
-    aim = aim_at_target(src, tgt, ships, world.initial_by_id, world.ang_vel, world=world)
-    if aim is None:
-        return False
-    angle, turns = aim
-    _commit_fleet(world, moves, spent, target_locked, src.id, tgt.id, angle, turns, int(ships))
-    mode_log[src.id] = label
-    return True
+        aim = aim_at_target(src, tgt, ships, world.initial_by_id, world.ang_vel, world=world)
+        if aim is None:
+            continue
+        angle, turns = aim
+        # idea: ownership at arrival -- skip a destination the do-nothing
+        # projection loses before our ships could get there (estimated at the
+        # direct ETA to the destination). Don't feed a planet we won't hold.
+        dest_eta = max(1, int(math.ceil(dest_d / fleet_speed(max(1, int(ships))))))
+        owner_at, _ships_at = predict_defender_at_arrival(world, dest, dest_eta)
+        if owner_at != world.player:
+            continue
+        _commit_fleet(world, moves, spent, target_locked, src.id, tgt.id, angle, turns, int(ships))
+        mode_log[src.id] = label
+        mode_log.setdefault(dest.id, "reinforced")  # protect dest from draining
+        return True
+    return False
+
+
+def _reaction_margin(turns):
+    """Extra ships to add to a capture, scaled by flight time. A near target
+    (<= REACT_FREE_TURNS) gets 0 -- the enemy can't reinforce in time. Beyond
+    that, the margin ramps linearly to REACT_MARGIN_SHIPS over REACT_SCALE_TURNS,
+    covering reinforcements the enemy can route in during a long flight."""
+    if turns <= REACT_FREE_TURNS:
+        return 0
+    ramp = min(1.0, (turns - REACT_FREE_TURNS) / max(1, REACT_SCALE_TURNS))
+    return int(round(ramp * REACT_MARGIN_SHIPS))
+
+
+def _planet_pressure(world, planet):
+    """How stressed a planet is = incoming enemy ships minus its own defense
+    (garrison + a 2-turn production buffer + inbound friendlies). Higher means
+    more under pressure; used to flow surplus toward the planets that need it."""
+    enemy_in, _eta = _incoming_enemy(world, planet.id)
+    friendly_in = _incoming_friendly(world, planet.id)
+    defense = float(planet.ships) + float(planet.production) * 2 + friendly_in
+    return enemy_in - defense
 
 
 def _enemy_pressure_quadrant(world):
@@ -4719,7 +4774,10 @@ def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
             # Enemy planets grow each turn — need garrison AT ARRIVAL, not now.
             # Only fire if we can guarantee capture; never send a partial fleet.
             if tgt.owner != -1:
-                need_arrival = effective_needed_to_capture(tgt, turns, world)
+                # Exact garrison-at-arrival + a flight-time-scaled buffer for
+                # reinforcements the enemy can route in during a long flight.
+                need_arrival = (effective_needed_to_capture(tgt, turns, world)
+                                + _reaction_margin(turns))
                 if avail < need_arrival + keep:
                     continue  # not enough to surely take it -> skip
                 send = max(send, need_arrival)
@@ -7493,7 +7551,11 @@ def o_handle_defense(world, rescue_needs, available, spent, target_locked,
     if not rescue_needs:
         return
 
-    for victim_id, (deficit, deadline, victim) in rescue_needs.items():
+    # Defend by what we'd lose, most valuable first: a high-production planet
+    # hurts most to lose, so when rescuers are scarce it gets first claim.
+    ordered = sorted(rescue_needs.items(),
+                     key=lambda kv: (-float(kv[1][2].production), -int(kv[1][2].ships)))
+    for victim_id, (deficit, deadline, victim) in ordered:
         if victim_id in target_locked:
             continue
         need = deficit + o_DEFENSE_OVERSEND
