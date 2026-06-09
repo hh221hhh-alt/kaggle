@@ -184,6 +184,16 @@ OPP_W_PROD = 1.0
 OPP_W_COST = 0.1
 OPP_W_DIST = 0.05
 OPP_MAX_COALITION = 3            # max planets that may combine on one opportunistic target
+# Parent (territory anchor) system. Parents = anchored quadrants; the anchor
+# planet of a quadrant is its most central (corner-ward), static-preferred owned
+# planet. Ships from planets that drift OUT of our anchored quadrants are pulled
+# back to the nearest anchor.
+PARENT_MAX = 4                   # at most one anchor per quadrant
+PARENT_GROW_MIN_PLANETS = 3      # add an anchor in a quadrant once we own this many there
+INTERIOR_CAPTURE_BONUS = 20.0    # late capture: prefer targets inside our anchored quadrants
+INTERIOR_OUTSIDE_PENALTY = 10.0  # ...and mildly avoid capturing outside our territory
+DRIFT_RECLAIM_SECOND_DELAY = 5   # a drifted planet reclaims now and once more after this many turns
+DRIFT_RECLAIM_KEEP_PROD = 4      # drifted planets with production >= this keep a defensive reserve
 O_MAX_TRAVEL_CAP = 15        # early game: never launch a fleet taking more turns than this
 COLLECTOR_ENABLED = False      # set True to re-enable collector fleet strategy
 PARENT_ENABLED = True          # parent planet strategy
@@ -1860,6 +1870,9 @@ _agent_step = 0
 _game_num_players = None
 _home_quadrant = None       # fixed home quadrant (set at step 0)
 _parent_ids = []            # fixed parent planet IDs (set at step 0)
+_parent_quads = set()       # anchored quadrants (our territory); grows up to PARENT_MAX
+_drift_start = {}           # planet id -> step it drifted out of our territory
+_drift_count = {}           # planet id -> reclaims done since it drifted
 _starting_max_prod = None   # max production of starting planets (set at step 0)
 _idle_streak = {}           # planet_id -> consecutive turns with no target
 _2p_patient_streak = 0
@@ -3056,7 +3069,14 @@ def _score_target(src, tgt, world):
         return dist_score * 4 + prod_score * 3 + cost_score * 4 + dir_score * 4
 
     # Mid/late: production matters MORE than early — weight it x6.
-    return dist_score * 4 + prod_score * 6 + cost_score * 4 + dir_score * 4
+    # Interior priority: favour capturing inside our anchored quadrants, mildly
+    # avoid reaching outside (clear weakened enemies are handled separately by the
+    # unrestricted opportunistic-attack pass, so good chances outside are still taken).
+    interior = 0.0
+    if _parent_quads:
+        interior = (INTERIOR_CAPTURE_BONUS if _get_quadrant(tgt) in _parent_quads
+                    else -INTERIOR_OUTSIDE_PENALTY)
+    return dist_score * 4 + prod_score * 6 + cost_score * 4 + dir_score * 4 + interior
 
 
 def _counter_snipe_candidates(world, src, max_travel, target_locked):
@@ -4201,6 +4221,10 @@ def handle_frontier_concentration(world, available, spent, target_locked, moves,
             continue
         if _get_quadrant(src) == target_q:
             continue  # target-quadrant planets keep ships for attack/defense
+        # Only interior (anchored-quadrant) surplus flows forward; planets that
+        # drifted outside our territory are handled by the reclaim pass.
+        if _parent_quads and _get_quadrant(src) not in _parent_quads:
+            continue
         keep = _safe_reserve(world, src)
         surplus = (available[src.id] - spent[src.id]) - keep
         if surplus < MIN_DISPATCH_SHIPS:
@@ -4463,6 +4487,94 @@ def _planet_initial_quadrant(planet, world):
     if init is None:
         return _get_quadrant(planet)
     return _get_quadrant_from_pos(init.x, init.y)
+
+
+def _parent_anchor(world, q):
+    """The anchor planet of quadrant q = our most central (corner-ward),
+    static-preferred owned planet currently in it. None if we own none there."""
+    cand = [p for p in world.my_planets if _get_quadrant(p) == q]
+    if not cand:
+        return None
+    cand.sort(key=lambda p: (0 if is_static_planet(p) else 1, -_wall_dist_in_quadrant(p)))
+    return cand[0]
+
+
+def _update_parent_quads(world):
+    """Maintain the set of anchored quadrants (our territory). Start with the
+    home quadrant plus, in 2P, the next most-owned quadrant (aim for half the
+    board); 4P starts with home only. Drop quadrants we no longer occupy (and
+    refill from where we're now strongest), and grow up to PARENT_MAX as we
+    secure new quadrants (>= PARENT_GROW_MIN_PLANETS owned)."""
+    owned = defaultdict(int)
+    for p in world.my_planets:
+        owned[_get_quadrant(p)] += 1
+    occupied = [q for q in range(4) if owned[q] > 0]
+    keep = {q for q in _parent_quads if q in occupied}
+    _parent_quads.clear()
+    _parent_quads.update(keep)
+    if not occupied:
+        return
+    baseline = 2 if world.is_2p else 1
+    # home first, then most-owned (so a lost home falls back to where we're strong)
+    pr = sorted(occupied, key=lambda q: (q != _home_quadrant, -owned[q]))
+    for q in pr:
+        if len(_parent_quads) >= baseline:
+            break
+        _parent_quads.add(q)
+    for q in sorted(occupied, key=lambda q: -owned[q]):
+        if len(_parent_quads) >= PARENT_MAX:
+            break
+        if q not in _parent_quads and owned[q] >= PARENT_GROW_MIN_PLANETS:
+            _parent_quads.add(q)
+
+
+def handle_reclaim_drift(world, available, spent, target_locked, moves, mode_log):
+    """Pull ships from planets that have drifted OUT of our anchored quadrants
+    back to the nearest anchor, keeping our force coherent. A drifted planet
+    reclaims immediately and once more after DRIFT_RECLAIM_SECOND_DELAY turns,
+    then stops (it keeps its production and acts normally). High-production
+    planets (>= DRIFT_RECLAIM_KEEP_PROD) keep a defensive reserve; others send
+    everything."""
+    if not _parent_quads:
+        return
+    anchors = [a for a in (_parent_anchor(world, q) for q in _parent_quads) if a is not None]
+    if not anchors:
+        return
+    for p in world.my_planets:
+        q = _get_quadrant(p)
+        if q in _parent_quads:
+            _drift_start.pop(p.id, None)   # back inside -> reset drift state
+            _drift_count.pop(p.id, None)
+            continue
+        if mode_log.get(p.id):
+            continue
+        if p.id not in _drift_start:
+            _drift_start[p.id] = world.step
+            _drift_count[p.id] = 0
+        cnt = _drift_count.get(p.id, 0)
+        since = world.step - _drift_start[p.id]
+        if cnt == 0:
+            pass                                   # immediate reclaim
+        elif cnt == 1 and since >= DRIFT_RECLAIM_SECOND_DELAY:
+            pass                                   # the +DELAY reclaim
+        else:
+            continue                               # between reclaims, or done (>=2)
+        keep = _safe_reserve(world, p) if float(p.production) >= DRIFT_RECLAIM_KEEP_PROD else 0
+        send = (available[p.id] - spent[p.id]) - keep
+        if send < MIN_DISPATCH_SHIPS:
+            continue
+        dest = min((a for a in anchors if a.id != p.id),
+                   key=lambda a: dist(p.x, p.y, a.x, a.y), default=None)
+        if dest is None:
+            continue
+        aim = aim_at_target(p, dest, send, world.initial_by_id, world.ang_vel, world=world)
+        if aim is None:
+            continue
+        angle, turns = aim
+        _commit_fleet(world, moves, spent, target_locked,
+                      p.id, dest.id, angle, turns, int(send))
+        mode_log[p.id] = "reclaim-drift"
+        _drift_count[p.id] = cnt + 1
 
 
 def handle_parent_evac(world, available, spent, target_locked, moves, mode_log):
@@ -4850,9 +4962,14 @@ def plan_moves(world, deadline=None):
     if not _over_budget():
         handle_steady_fire(world, available, spent, target_locked, moves, mode_log)
 
-    # Pieces 1+3 — frontier concentration: drain inside/back surplus forward,
-    # 70% to frontier (attack + thick defense), 30% to non-frontier (thin
-    # defense). No pulling back to base (replaces evacuation).
+    # Reclaim: pull ships from planets that drifted outside our anchored
+    # territory back to the nearest anchor (keeps our force coherent). Runs
+    # before frontier concentration so drifted planets go home, not forward.
+    if not _over_budget():
+        handle_reclaim_drift(world, available, spent, target_locked, moves, mode_log)
+
+    # Frontier concentration: drain INTERIOR (anchored-quadrant) surplus toward
+    # the frontier / most-pressured direction. (Drifted planets are reclaimed.)
     if not _over_budget():
         handle_frontier_concentration(world, available, spent, target_locked, moves, mode_log)
 
@@ -8666,6 +8783,9 @@ def agent(obs, config=None):
         _starting_max_prod = None
         _home_quadrant = None
         _parent_ids = []
+        _parent_quads.clear()
+        _drift_start.clear()
+        _drift_count.clear()
         _2p_patient_streak = 0
         _2p_prod_share_history = []
         _neutral_prev_ships.clear()
@@ -8700,9 +8820,9 @@ def agent(obs, config=None):
     if not world.my_planets:
         return []
 
-    # Fix parents once we reach PARENT_START_TURN (when static planets are owned)
-    if PARENT_ENABLED and not _parent_ids and world.step >= PARENT_START_TURN:
-        _parent_ids = [p.id for p in _compute_parent_candidates(world)]
+    # Maintain anchored quadrants (territory) each turn from PARENT_START_TURN on.
+    if PARENT_ENABLED and world.step >= PARENT_START_TURN:
+        _update_parent_quads(world)
 
     
     if not world.is_2p:
