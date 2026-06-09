@@ -189,7 +189,8 @@ OPP_MAX_COALITION = 3            # max planets that may combine on one opportuni
 # planet. Ships from planets that drift OUT of our anchored quadrants are pulled
 # back to the nearest anchor.
 PARENT_MAX = 4                   # at most one anchor per quadrant
-PARENT_GROW_MIN_PLANETS = 3      # add an anchor in a quadrant once we own this many there
+PARENT_GROW_FRACTION = 0.40      # add an anchor in a quadrant once we own >= this share of its planets
+BOARD_FILL_SWITCH = 0.80         # leave the early (old-bot) phase once this share of the board is claimed
 INTERIOR_CAPTURE_BONUS = 20.0    # late capture: prefer targets inside our anchored quadrants
 INTERIOR_OUTSIDE_PENALTY = 10.0  # ...and mildly avoid capturing outside our territory
 DRIFT_RECLAIM_SECOND_DELAY = 5   # a drifted planet reclaims now and once more after this many turns
@@ -1873,6 +1874,7 @@ _parent_ids = []            # fixed parent planet IDs (set at step 0)
 _parent_quads = set()       # anchored quadrants (our territory); grows up to PARENT_MAX
 _drift_start = {}           # planet id -> step it drifted out of our territory
 _drift_count = {}           # planet id -> reclaims done since it drifted
+_late_latched = False       # True once the board is >= BOARD_FILL_SWITCH claimed (leave early phase)
 _starting_max_prod = None   # max production of starting planets (set at step 0)
 _idle_streak = {}           # planet_id -> consecutive turns with no target
 _2p_patient_streak = 0
@@ -4504,10 +4506,14 @@ def _update_parent_quads(world):
     home quadrant plus, in 2P, the next most-owned quadrant (aim for half the
     board); 4P starts with home only. Drop quadrants we no longer occupy (and
     refill from where we're now strongest), and grow up to PARENT_MAX as we
-    secure new quadrants (>= PARENT_GROW_MIN_PLANETS owned)."""
+    secure new quadrants (own >= PARENT_GROW_FRACTION of that quadrant's planets)."""
     owned = defaultdict(int)
+    total = defaultdict(int)
     for p in world.my_planets:
         owned[_get_quadrant(p)] += 1
+    for p in world.planets:
+        if p.id not in world.comet_ids:
+            total[_get_quadrant(p)] += 1
     occupied = [q for q in range(4) if owned[q] > 0]
     keep = {q for q in _parent_quads if q in occupied}
     _parent_quads.clear()
@@ -4521,10 +4527,11 @@ def _update_parent_quads(world):
         if len(_parent_quads) >= baseline:
             break
         _parent_quads.add(q)
+    # growth: a quadrant becomes an anchor once we own >= 40% of its planets
     for q in sorted(occupied, key=lambda q: -owned[q]):
         if len(_parent_quads) >= PARENT_MAX:
             break
-        if q not in _parent_quads and owned[q] >= PARENT_GROW_MIN_PLANETS:
+        if q not in _parent_quads and total[q] > 0 and owned[q] >= PARENT_GROW_FRACTION * total[q]:
             _parent_quads.add(q)
 
 
@@ -8774,9 +8781,10 @@ def agent(obs, config=None):
     global _agent_step, _pending_commitments
     global _game_num_players, _2p_patient_streak, _2p_prod_share_history
 
-    global _opp_profile, _starting_max_prod, _home_quadrant, _parent_ids
+    global _opp_profile, _starting_max_prod, _home_quadrant, _parent_ids, _late_latched
     obs_step = _read(obs, "step", 0) or 0
     if obs_step == 0:
+        _late_latched = False
         _agent_step = 0
         _pending_commitments = []
         _game_num_players = None
@@ -8807,9 +8815,21 @@ def agent(obs, config=None):
             _starting_max_prod = max((int(p.production) for p in w0.my_planets), default=1)
             _home_quadrant = _get_quadrant(w0.my_planets[0])
 
+    # Early phase ends when the board is mostly claimed (not a fixed turn): stay
+    # in the old-bot land-grab while plenty of neutrals remain, then latch into
+    # our own pipeline once >= BOARD_FILL_SWITCH of the (non-comet) planets are owned.
+    if not _late_latched:
+        raw = _read(obs, "planets", []) or []
+        cids = set(int(c) for c in (_read(obs, "comet_planet_ids", []) or []))
+        alive = [p for p in raw if len(p) >= 2 and int(p[0]) >= 0 and int(p[0]) not in cids]
+        total = len(alive)
+        claimed = sum(1 for p in alive if int(p[1]) != -1)
+        if total > 0 and claimed / total >= BOARD_FILL_SWITCH:
+            _late_latched = True
+
     # Early game: delegate to the fused o_ pipeline (builds its own World).
     # We do NOT build our own World here — avoids a wasteful double parse/turn.
-    if step_est < MIMIC_OLD_UNTIL:
+    if not _late_latched:
         try:
             return o_agent(obs, config)
         except Exception:
@@ -8820,8 +8840,8 @@ def agent(obs, config=None):
     if not world.my_planets:
         return []
 
-    # Maintain anchored quadrants (territory) each turn from PARENT_START_TURN on.
-    if PARENT_ENABLED and world.step >= PARENT_START_TURN:
+    # Maintain anchored quadrants (territory) each turn we run our own pipeline.
+    if PARENT_ENABLED:
         _update_parent_quads(world)
 
     
