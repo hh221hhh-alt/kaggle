@@ -185,6 +185,7 @@ OPP_W_PROD = 1.0
 OPP_W_COST = 0.1
 OPP_W_DIST = 0.05
 OPP_MAX_COALITION = 3            # max planets that may combine on one opportunistic target
+ASSAULT_MAX_COALITION = 4        # max planets that may combine to crack one assault target
 # Parent (territory anchor) system. Parents = anchored quadrants; the anchor
 # planet of a quadrant is its most central (corner-ward), static-preferred owned
 # planet. Ships from planets that drift OUT of our anchored quadrants are pulled
@@ -4898,8 +4899,9 @@ def handle_enemy_assault(world, available, spent, target_locked, moves, mode_log
     4P: pick the WEAKEST enemy; fire when our deployable >= ratio x its garrison,
         and only hit its planets in our-occupied-or-adjacent quadrants (not the
         diagonal one).
-    Highest production first, send enough to capture at arrival (no per-target
-    cap, so big planets get cracked), keep almost no reserve."""
+    Highest production first; combine the nearest planets (no reserve kept --
+    we're dominant) until the sequential-combat sim confirms capture, so big
+    planets get cracked by several planets at once."""
     if not world.enemy_planets:
         return
     my_available = sum(max(0, available[p.id] - spent[p.id]) for p in world.my_planets)
@@ -4921,35 +4923,39 @@ def handle_enemy_assault(world, available, spent, target_locked, moves, mode_log
             continue
         if quad_filter and not _assault_quadrant_ok(world, tgt):
             continue
-        best = None
+        contribs = []   # (src, angle, turns, send)
+        captured = False
         for src in sorted(world.my_planets, key=lambda p: dist(p.x, p.y, tgt.x, tgt.y)):
             if mode_log.get(src.id):
                 continue
-            avail = available[src.id] - spent[src.id]
-            if avail < MIN_DISPATCH_SHIPS:
+            spare = available[src.id] - spent[src.id]   # dominant -> no reserve kept
+            if spare < MIN_DISPATCH_SHIPS:
                 continue
-            aim = aim_at_target(src, tgt, avail, world.initial_by_id, world.ang_vel,
+            aim = aim_at_target(src, tgt, spare, world.initial_by_id, world.ang_vel,
                                 world=world, check_approach=True)
             if aim is None:
                 continue
             _a0, turns0 = aim
             need = effective_needed_to_capture(tgt, turns0, world) + _reaction_margin(turns0)
-            send = max(MIN_DISPATCH_SHIPS, need)
-            if avail < send:
-                continue
+            send = min(spare, max(MIN_DISPATCH_SHIPS, need))
             re_aim = aim_at_target(src, tgt, send, world.initial_by_id, world.ang_vel,
                                    world=world, check_approach=True)
             if re_aim is None:
                 continue
             angle, turns = re_aim
-            best = (src, angle, turns, send)
-            break
-        if best is None:
+            contribs.append((src, angle, turns, send))
+            if _sequential_capture_ok(int(tgt.ships), tgt.production,
+                                      [(t, s) for _s, _a, t, s in contribs]):
+                captured = True
+                break
+            if len(contribs) >= ASSAULT_MAX_COALITION:
+                break
+        if not captured:
             continue
-        src, angle, turns, send = best
-        _commit_fleet(world, moves, spent, target_locked,
-                      src.id, tgt.id, angle, turns, int(send))
-        mode_log[src.id] = "assault"
+        for src, angle, turns, send in contribs:
+            _commit_fleet(world, moves, spent, target_locked,
+                          src.id, tgt.id, angle, turns, int(send))
+            mode_log[src.id] = "assault"
         mode_log[tgt.id] = "assault-target"
 
 
