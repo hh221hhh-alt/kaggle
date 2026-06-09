@@ -172,6 +172,18 @@ REACT_MARGIN_SHIPS = 8           # max extra ships added for a long-flight captu
 # the frontline signal anticipates threats before the enemy even launches.
 PRESSURE_REACH_HORIZON = 12      # turns within which enemy garrison counts as "reachable"
 PRESSURE_REACH_WEIGHT = 0.5      # weight of potential (reachable) mass vs in-flight ships
+# Opportunistic attack: an enemy that just launched is a target if its CURRENT
+# garrison is thin relative to its value -> threshold = OPP_BASE + production*OPP_PER_PROD
+# (prod1->12, prod3->20, prod5->28). High-output planets are worth taking even
+# when stocked; low-output ones only when nearly empty.
+OPP_BASE = 8.0
+OPP_PER_PROD = 4.0
+# Opportunistic target priority = comprehensive of value / cost / distance
+# (higher production better, fewer ships to crack better, nearer better).
+OPP_W_PROD = 1.0
+OPP_W_COST = 0.1
+OPP_W_DIST = 0.05
+OPP_MAX_COALITION = 3            # max planets that may combine on one opportunistic target
 O_MAX_TRAVEL_CAP = 15        # early game: never launch a fleet taking more turns than this
 COLLECTOR_ENABLED = False      # set True to re-enable collector fleet strategy
 PARENT_ENABLED = True          # parent planet strategy
@@ -3804,41 +3816,89 @@ def handle_intercept(world, available, spent, target_locked, moves, mode_log):
                     break
 
 
+def _sequential_capture_ok(garrison_now, production, contribs):
+    """Will the combined fleets capture the target? Fleets fight the garrison in
+    arrival order; between arrivals the garrison grows by production. We capture
+    the first time an arriving fleet exceeds the (grown) garrison; otherwise it
+    just softens it. contribs = list of (eta, ships)."""
+    garrison = float(garrison_now)
+    prev_t = 0
+    for eta, ships in sorted(contribs, key=lambda c: c[0]):
+        garrison += max(0.0, float(production)) * (eta - prev_t)
+        prev_t = eta
+        if ships > garrison:
+            return True
+        garrison -= ships
+    return False
+
+
 def handle_opportunistic_attack(world, available, spent, target_locked, moves, mode_log):
-    """Idea 8: attack enemy planets immediately after they launched a fleet
-    (garrison is temporarily thin). Uses _enemy_recently_launched tracking.
-    """
+    """Hit enemy planets that just launched a fleet while their garrison is thin
+    RELATIVE TO THEIR VALUE: eligible if current ships <= OPP_BASE +
+    production*OPP_PER_PROD (a high-output planet is worth taking even when
+    stocked; a low-output one only when nearly empty). Fire from the nearest
+    planet(s) with spare ships (each keeping its defensive reserve); if a single
+    planet can't crack it, combine up to OPP_MAX_COALITION nearby planets,
+    sequential-combat verified. Targets ranked by a value/cost/distance score."""
     if not _enemy_recently_launched:
         return
-    for tgt_id in list(_enemy_recently_launched):
+    cands = []
+    for tgt_id in _enemy_recently_launched:
         if tgt_id in target_locked:
             continue
         tgt = world.planet_by_id.get(tgt_id)
         if tgt is None or tgt.owner == world.player or tgt.owner == -1:
             continue
-        for src in sorted(world.my_planets,
-                          key=lambda p: dist(p.x, p.y, tgt.x, tgt.y)):
+        if not is_targetable(world, tgt):
+            continue
+        if int(tgt.ships) > OPP_BASE + float(tgt.production) * OPP_PER_PROD:
+            continue  # not thin enough for its value
+        nd = min((dist(p.x, p.y, tgt.x, tgt.y) for p in world.my_planets), default=1e9)
+        score = (OPP_W_PROD * float(tgt.production)
+                 - OPP_W_COST * int(tgt.ships)
+                 - OPP_W_DIST * nd)
+        cands.append((score, tgt))
+    if not cands:
+        return
+    cands.sort(key=lambda st: -st[0])
+    for _score, tgt in cands:
+        if tgt.id in target_locked:
+            continue
+        contribs = []   # (src, angle, turns, send)
+        captured = False
+        for src in sorted(world.my_planets, key=lambda p: dist(p.x, p.y, tgt.x, tgt.y)):
             if mode_log.get(src.id):
                 continue
-            avail = available[src.id] - spent[src.id]
-            need = int(tgt.ships) + 1
-            if need > ATTACK_MAX_SHIPS:
+            keep = _safe_reserve(world, src)
+            spare = (available[src.id] - spent[src.id]) - keep
+            if spare < MIN_DISPATCH_SHIPS:
                 continue
-            send = max(MIN_DISPATCH_SHIPS, min(need, ATTACK_MAX_SHIPS))
-            if avail < send:
-                continue
-            if not is_in_approaching_direction(src, tgt, world.ang_vel):
-                continue
-            aim = aim_at_target(src, tgt, send, world.initial_by_id,
+            aim = aim_at_target(src, tgt, spare, world.initial_by_id,
                                 world.ang_vel, world=world, check_approach=True)
             if aim is None:
                 continue
-            angle, turns = aim
+            _a0, turns0 = aim
+            need = effective_needed_to_capture(tgt, turns0, world) + _reaction_margin(turns0)
+            send = min(spare, max(MIN_DISPATCH_SHIPS, need))
+            re_aim = aim_at_target(src, tgt, send, world.initial_by_id,
+                                   world.ang_vel, world=world, check_approach=True)
+            if re_aim is None:
+                continue
+            angle, turns = re_aim
+            contribs.append((src, angle, turns, send))
+            if _sequential_capture_ok(int(tgt.ships), tgt.production,
+                                      [(t, s) for _s, _a, t, s in contribs]):
+                captured = True
+                break
+            if len(contribs) >= OPP_MAX_COALITION:
+                break
+        if not captured:
+            continue
+        for src, angle, turns, send in contribs:
             _commit_fleet(world, moves, spent, target_locked,
                           src.id, tgt.id, angle, turns, int(send))
             mode_log[src.id] = "opportunistic-attack"
-            mode_log[tgt.id] = "opportunistic-target"
-            break
+        mode_log[tgt.id] = "opportunistic-target"
 
 
 def handle_waypoint_capture(world, available, spent, target_locked, moves, mode_log):
@@ -4644,47 +4704,76 @@ def handle_parent_attack(world, available, spent, target_locked, moves, mode_log
                         break
 
 
+def _assault_quadrant_ok(world, tgt):
+    """4P: only assault targets in a quadrant we occupy or adjacent to one (a
+    clockwise neighbour); skip the diagonally-opposite quadrant -- too far, across
+    the board. (2P callers bypass this.)"""
+    our_quads = {_get_quadrant(p) for p in world.my_planets}
+    if not our_quads:
+        return False
+    tq = _get_quadrant(tgt)
+    for q in our_quads:
+        if tq == q or tq == _CW_NEXT[q] or tq == _CCW_NEXT[q]:
+            return True
+    return False
+
+
 def handle_enemy_assault(world, available, spent, target_locked, moves, mode_log):
-    """Launch all-out attack on all enemy planets when we have ENEMY_ASSAULT_RATIO times
-    their total garrison. Targets sorted by production (highest first).
-    """
+    """All-out attack when we have overwhelming force.
+    2P: fire when our total deployable >= ENEMY_ASSAULT_RATIO x the (single)
+        enemy's garrison; hit all its planets.
+    4P: pick the WEAKEST enemy; fire when our deployable >= ratio x its garrison,
+        and only hit its planets in our-occupied-or-adjacent quadrants (not the
+        diagonal one).
+    Highest production first, send enough to capture at arrival (no per-target
+    cap, so big planets get cracked), keep almost no reserve."""
     if not world.enemy_planets:
         return
-    enemy_total = sum(int(p.ships) for p in world.enemy_planets)
     my_available = sum(max(0, available[p.id] - spent[p.id]) for p in world.my_planets)
-    if my_available < enemy_total * ENEMY_ASSAULT_RATIO:
+    if world.is_2p:
+        targets = list(world.enemy_planets)
+        quad_filter = False
+    else:
+        by_owner = defaultdict(list)
+        for p in world.enemy_planets:
+            by_owner[p.owner].append(p)
+        targets = min(by_owner.values(), key=lambda ps: sum(int(p.ships) for p in ps))
+        quad_filter = True
+    enemy_garrison = sum(int(p.ships) for p in targets)
+    if enemy_garrison <= 0 or my_available < enemy_garrison * ENEMY_ASSAULT_RATIO:
         return
 
-    for tgt in sorted(world.enemy_planets, key=lambda p: -int(p.production)):
-        if tgt.id in target_locked:
+    for tgt in sorted(targets, key=lambda p: -float(p.production)):
+        if tgt.id in target_locked or not is_targetable(world, tgt):
             continue
-        if not is_targetable(world, tgt):
+        if quad_filter and not _assault_quadrant_ok(world, tgt):
             continue
-        need = int(tgt.ships) + 1
-        if need > ATTACK_MAX_SHIPS:
-            continue
-        send = max(MIN_DISPATCH_SHIPS, min(need, ATTACK_MAX_SHIPS))
-        best_src = None
-        best_d = float("inf")
-        for src in world.my_planets:
-            status = mode_log.get(src.id)
-            if status and status not in ("surplus-collect", "absorb"):
+        best = None
+        for src in sorted(world.my_planets, key=lambda p: dist(p.x, p.y, tgt.x, tgt.y)):
+            if mode_log.get(src.id):
                 continue
             avail = available[src.id] - spent[src.id]
-            if avail < send:
+            if avail < MIN_DISPATCH_SHIPS:
                 continue
-            aim = aim_at_target(src, tgt, send, world.initial_by_id, world.ang_vel,
+            aim = aim_at_target(src, tgt, avail, world.initial_by_id, world.ang_vel,
                                 world=world, check_approach=True)
             if aim is None:
                 continue
-            angle, turns = aim
-            d = dist(src.x, src.y, tgt.x, tgt.y)
-            if d < best_d:
-                best_d = d
-                best_src = (src, angle, turns)
-        if best_src is None:
+            _a0, turns0 = aim
+            need = effective_needed_to_capture(tgt, turns0, world) + _reaction_margin(turns0)
+            send = max(MIN_DISPATCH_SHIPS, need)
+            if avail < send:
+                continue
+            re_aim = aim_at_target(src, tgt, send, world.initial_by_id, world.ang_vel,
+                                   world=world, check_approach=True)
+            if re_aim is None:
+                continue
+            angle, turns = re_aim
+            best = (src, angle, turns, send)
+            break
+        if best is None:
             continue
-        src, angle, turns = best_src
+        src, angle, turns, send = best
         _commit_fleet(world, moves, spent, target_locked,
                       src.id, tgt.id, angle, turns, int(send))
         mode_log[src.id] = "assault"
@@ -4746,6 +4835,14 @@ def plan_moves(world, deadline=None):
     handle_defense(world, rescue_needs, available, spent, target_locked, moves, mode_log)
     if not _over_budget():
         handle_home_defense(world, available, spent, target_locked, moves, mode_log)
+
+    # Tempo strikes BEFORE the general capture pass, so they claim weakened /
+    # finishable enemies first: hit planets that just launched (thin), then go
+    # all-out when we hold an overwhelming force advantage.
+    if not _over_budget():
+        handle_opportunistic_attack(world, available, spent, target_locked, moves, mode_log)
+    if not _over_budget():
+        handle_enemy_assault(world, available, spent, target_locked, moves, mode_log)
 
     # Piece 2 — coordinated strike: steady_fire picks the best target by board
     # forward-sim and (for enemies) sends enough to capture. Frontier planets are
