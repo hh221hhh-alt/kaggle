@@ -122,6 +122,7 @@ ATTACK_MAX_SHIPS = 20          # non-collector attack cap
 
 COMET_EVAC_REMAINING_TURNS = 8
 COMET_EVAC_MIN_SHIPS = MIN_DISPATCH_SHIPS
+COMET_CAPTURE_MIN_LIFE = 10    # only grab a comet if we'd own it at least this many turns
 
 DOOM_EVAC_ENABLED = True
 DOOM_EVAC_MIN_SHIPS = MIN_DISPATCH_SHIPS
@@ -2430,11 +2431,13 @@ def _commit_fleet(world, moves, spent, target_locked,
             is_static = (init is not None and _init_is_static(init))
             in_home = (_home_quadrant is not None and
                        _get_quadrant(tgt_obj) == _home_quadrant)
+            is_comet = int(target_id) in world.comet_ids
             # Skip the direction check (judged at launch position) only for:
             #  - static targets in our home territory (any time), or
-            #  - static targets during the early land-grab (before turn 50).
+            #  - static targets during the early land-grab (before turn 50), or
+            #  - comets (they ride elliptical paths, not the rotation flow).
             # MOVING targets are always direction-checked (no chasing), incl. early.
-            skip_dir = (is_static and in_home) or (world.step < 50 and is_static)
+            skip_dir = (is_static and in_home) or (world.step < 50 and is_static) or is_comet
             if not skip_dir:
                 if not is_in_approaching_direction(src_obj, tgt_obj, world.ang_vel):
                     return
@@ -2912,6 +2915,57 @@ def handle_comet_evac(world, available, spent, target_locked, moves, mode_log):
         _commit_fleet(world, moves, spent, target_locked,
                       src.id, best.id, angle, turns, int(avail))
         mode_log[src.id] = "comet-evac"
+
+
+def handle_comet_capture(world, available, spent, target_locked, moves, mode_log):
+    """Grab neutral/enemy comets for their temporary +1/turn production, but only
+    when we'd own one long enough to profit: ownership time (remaining life minus
+    flight) must be >= COMET_CAPTURE_MIN_LIFE AND >= the capture cost (so the
+    production we harvest beats the ships we spend). The existing comet-evac pulls
+    those ships back off before the comet leaves the board."""
+    if not world.comet_remaining:
+        return
+    comets = []
+    for cid, rem in world.comet_remaining.items():
+        if rem <= COMET_EVAC_REMAINING_TURNS or cid in target_locked:
+            continue
+        c = world.planet_by_id.get(cid)
+        if c is None or c.owner == world.player:
+            continue
+        comets.append((c, rem))
+    if not comets:
+        return
+    comets.sort(key=lambda cr: -cr[1])  # most life left first (most to harvest)
+    for c, rem in comets:
+        if c.id in target_locked:
+            continue
+        for src in sorted(world.my_planets, key=lambda p: dist(p.x, p.y, c.x, c.y)):
+            if mode_log.get(src.id):
+                continue
+            keep = _safe_reserve(world, src)
+            spare = (available[src.id] - spent[src.id]) - keep
+            if spare < MIN_DISPATCH_SHIPS:
+                continue
+            aim = aim_at_target(src, c, spare, world.initial_by_id, world.ang_vel, world=world)
+            if aim is None:
+                continue
+            _a0, turns0 = aim
+            need = effective_needed_to_capture(c, turns0, world)
+            ownership = rem - int(turns0)
+            if ownership < COMET_CAPTURE_MIN_LIFE or ownership < need:
+                continue  # not enough ownership time to profit
+            send = max(MIN_DISPATCH_SHIPS, need)
+            if spare < send:
+                continue
+            re_aim = aim_at_target(src, c, send, world.initial_by_id, world.ang_vel, world=world)
+            if re_aim is None:
+                continue
+            angle, turns = re_aim
+            _commit_fleet(world, moves, spent, target_locked,
+                          src.id, c.id, angle, turns, int(send))
+            mode_log[src.id] = "comet-capture"
+            mode_log[c.id] = "comet-capture-target"
+            break
 
 
 def _handle_search_expand_4p(world, available, spent, target_locked, moves, mode_log):
@@ -4968,6 +5022,11 @@ def plan_moves(world, deadline=None):
     # rich (fed by concentration), so this becomes the decisive concentrated blow.
     if not _over_budget():
         handle_steady_fire(world, available, spent, target_locked, moves, mode_log)
+
+    # Economy: grab worthwhile comets for their temporary production (evac pulls
+    # the ships back before the comet leaves).
+    if not _over_budget():
+        handle_comet_capture(world, available, spent, target_locked, moves, mode_log)
 
     # Reclaim: pull ships from planets that drifted outside our anchored
     # territory back to the nearest anchor (keeps our force coherent). Runs
