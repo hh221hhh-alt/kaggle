@@ -182,6 +182,11 @@ PRESSURE_FOCUS_MIN_SHIPS = 20    # ignore trivial total pressure (noise) -> fron
 REACT_FREE_TURNS = 3             # within this flight time the enemy can't react
 REACT_SCALE_TURNS = 6            # then reaction ramps to full over this many turns
 REACT_MARGIN_SHIPS = 8           # max extra ships added for a long-flight capture
+# Pressure metric: blend in-flight enemy (certain) with "reachable enemy mass"
+# (enemy garrison that could fly here within the horizon, distance-decayed) so
+# the frontline signal anticipates threats before the enemy even launches.
+PRESSURE_REACH_HORIZON = 12      # turns within which enemy garrison counts as "reachable"
+PRESSURE_REACH_WEIGHT = 0.5      # weight of potential (reachable) mass vs in-flight ships
 O_MAX_TRAVEL_CAP = 15        # early game: never launch a fleet taking more turns than this
 COLLECTOR_ENABLED = False      # set True to re-enable collector fleet strategy
 PARENT_ENABLED = True          # parent planet strategy
@@ -4603,14 +4608,35 @@ def _reaction_margin(turns):
     return int(round(ramp * REACT_MARGIN_SHIPS))
 
 
+def _reachable_enemy_mass(world, planet, horizon):
+    """Distance-decayed sum of enemy garrison that could straight-line reach this
+    planet within `horizon` turns. A nearer / bigger (=faster) enemy planet
+    counts for more. Anticipates pressure before the enemy has even launched."""
+    total = 0.0
+    for ep in world.enemy_planets:
+        ships = int(ep.ships)
+        if ships <= 0:
+            continue
+        reach = fleet_speed(max(1, ships)) * horizon
+        if reach <= 1e-6:
+            continue
+        decay = 1.0 - dist(ep.x, ep.y, planet.x, planet.y) / reach
+        if decay > 0.0:
+            total += ships * decay
+    return total
+
+
 def _planet_pressure(world, planet):
-    """How stressed a planet is = incoming enemy ships minus its own defense
-    (garrison + a 2-turn production buffer + inbound friendlies). Higher means
-    more under pressure; used to flow surplus toward the planets that need it."""
+    """How stressed a planet is = (in-flight enemy ships + a share of the enemy
+    mass that could reach it within the horizon) minus its own defense (garrison
+    + a 2-turn production buffer + inbound friendlies). Higher = more under
+    pressure; used to flow surplus toward the planets that need it. The reachable
+    term makes the signal react to where the enemy IS, not just to launched fleets."""
     enemy_in, _eta = _incoming_enemy(world, planet.id)
     friendly_in = _incoming_friendly(world, planet.id)
     defense = float(planet.ships) + float(planet.production) * 2 + friendly_in
-    return enemy_in - defense
+    reachable = _reachable_enemy_mass(world, planet, PRESSURE_REACH_HORIZON)
+    return enemy_in + PRESSURE_REACH_WEIGHT * reachable - defense
 
 
 def _enemy_pressure_quadrant(world):
