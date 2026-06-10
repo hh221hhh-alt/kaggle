@@ -4261,13 +4261,64 @@ def _enemy_pressure_quadrant(world):
 
 
 def handle_frontier_concentration(world, available, spent, target_locked, moves, mode_log):
-    """Mass leftover surplus toward one direction. If a single quadrant is
-    taking the bulk of incoming enemy fire, concentrate there (reinforce +
-    stage a counter). Otherwise default to the frontier. Inside/home planets
-    drain forward; planets already in the target quadrant keep their ships.
-    Replaces the old home-evacuation (no pulling back to base)."""
+    """Mass leftover surplus toward the edges of our territory.
+
+    Occupied territory = our anchored quadrants. When it spans 2+ quadrants, the
+    MIDDLE can stay thin: every planet pushes its surplus to whichever END is
+    nearer -- the FRONTIER (rotation-forward edge, where we attack) or the
+    REVERSE-FRONTIER (the trailing edge). With a single quadrant, fall back to
+    sending toward the frontier (or the quadrant taking the bulk of enemy fire).
+    Each planet still keeps its own safe reserve, so threatened planets aren't
+    stripped."""
     if _home_quadrant is None:
         return
+
+    # --- Multi-quadrant territory: frontier by default, reverse-frontier on need ---
+    # Surplus pushes to the FRONTIER (attack edge). But if the REVERSE-FRONTIER
+    # (trailing edge) is under enemy threat, the nearest planets cover that need
+    # first; only the remainder goes to the frontier. The middle stays thin.
+    if len(_parent_quads) >= 2:
+        fwd = _CW_NEXT if world.ang_vel < 0 else _CCW_NEXT      # frontier direction
+        back = _CCW_NEXT if world.ang_vel < 0 else _CW_NEXT     # reverse-frontier
+        leading = [q for q in _parent_quads if fwd[q] not in _parent_quads]
+        trailing = [q for q in _parent_quads if back[q] not in _parent_quads]
+        if leading and trailing:
+            lead_q, trail_q = leading[0], trailing[0]
+            front_pool = [p for p in world.my_planets
+                          if _get_quadrant(p) in (fwd[lead_q], lead_q)]
+            rev_pool = [p for p in world.my_planets
+                        if _get_quadrant(p) in (back[trail_q], trail_q)]
+            # how many ships the rear actually needs (enemy threat on it)
+            rev_need = sum(max(0.0, _planet_pressure(world, p)) for p in rev_pool)
+            def _near_rev(p):
+                return min((dist(p.x, p.y, q.x, q.y) for q in rev_pool if q.id != p.id),
+                           default=float("inf"))
+            drainers = []
+            for src in world.my_planets:
+                if mode_log.get(src.id):
+                    continue
+                keep = _safe_reserve(world, src)
+                surplus = (available[src.id] - spent[src.id]) - keep
+                if surplus >= MIN_DISPATCH_SHIPS:
+                    drainers.append((src, surplus))
+            drainers.sort(key=lambda sp: _near_rev(sp[0]))  # nearest the rear first
+            sent_rev = 0.0
+            for src, surplus in drainers:
+                want_rev = sent_rev < rev_need
+                if want_rev:
+                    if _send_friendly_toward(world, src, rev_pool, surplus, target_locked,
+                                             moves, spent, mode_log, "to-reverse-frontier"):
+                        sent_rev += surplus
+                        continue
+                # default / fallback: push to the frontier
+                if not _send_friendly_toward(world, src, front_pool, surplus, target_locked,
+                                             moves, spent, mode_log, "to-frontier"):
+                    # frontier unreachable -> last resort, try the rear
+                    _send_friendly_toward(world, src, rev_pool, surplus, target_locked,
+                                          moves, spent, mode_log, "to-reverse-frontier")
+            return
+
+    # --- Single-quadrant territory: concentrate toward the frontier / pressure ---
     fq = _frontier_quadrant(_home_quadrant, world.ang_vel)
     focus_q = _enemy_pressure_quadrant(world)
     target_q = focus_q if focus_q is not None else fq
