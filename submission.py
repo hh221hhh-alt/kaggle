@@ -5242,7 +5242,10 @@ def plan_moves(world, deadline=None):
     # forward-sim and (for enemies) sends enough to capture. Frontier planets are
     # rich (fed by concentration), so this becomes the decisive concentrated blow.
     if not _over_budget():
-        handle_unified_strike(world, available, spent, target_locked, moves, mode_log)
+        # NOTE: handle_unified_strike (idea #1) under-fired in mid-late (dropped
+        # candidates past the forward-sim budget / gain floor -> too passive when
+        # ahead). Reverted to the proven steady_fire while that is fixed.
+        handle_steady_fire(world, available, spent, target_locked, moves, mode_log)
 
     # Economy: grab worthwhile comets for their temporary production (evac pulls
     # the ships back before the comet leaves).
