@@ -4506,6 +4506,148 @@ def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
             break
 
 
+def handle_unified_strike(world, available, spent, target_locked, moves, mode_log):
+    """(Q4 stage 2, contained) Unified late-game selection. Instead of each planet
+    independently picking its best capture, score ATTACK and DEFENSE candidates
+    from ALL planets by whole-board forward-sim gain, then greedily commit the
+    moves that improve the board most (one per target, source-budget aware).
+    Attack = capture an enemy/neutral; defense = reinforce an own planet the
+    do-nothing projection loses. Falls back to per-source steady_fire in the
+    early phase, when forward-sim is off, or on any error."""
+    is_early = world.step < EARLY_GAME_TURNS
+    if is_early or not FWD_LOOKAHEAD_ENABLED:
+        handle_steady_fire(world, available, spent, target_locked, moves, mode_log)
+        return
+    try:
+        baseline = o_melis_evaluate(world, our_step_action=None)
+    except Exception:
+        handle_steady_fire(world, available, spent, target_locked, moves, mode_log)
+        return
+
+    late_flush = world.remaining_steps <= 70
+    standing = _standing(world)
+    if late_flush or standing == "losing":
+        gain_floor = -2.0
+    elif standing == "winning":
+        gain_floor = 1.0
+    else:
+        gain_floor = 0.0
+
+    def spare_of(p, keep):
+        return (available[p.id] - spent[p.id]) - keep
+
+    try:
+        cands = []  # each: dict(kind, src, tgt, send, angle, turns, keep, heur, action)
+        # ---- ATTACK candidates: each source's top-K capturable targets ----
+        for src in world.my_planets:
+            if mode_log.get(src.id):
+                continue
+            if available[src.id] - spent[src.id] <= GARRISON_TARGET:
+                continue
+            tgts = sorted(
+                [p for p in world.planets
+                 if p.owner != world.player and p.id not in target_locked
+                 and is_targetable(world, p) and int(p.ships) < ATTACK_MAX_SHIPS
+                 and not friendly_already_committed(world, p.id)],
+                key=lambda p: -_score_target(src, p, world))[:FWD_LOOKAHEAD_TOPK]
+            for tgt in tgts:
+                keep = 0 if late_flush else _safe_reserve(world, src)
+                base_send = max(MIN_DISPATCH_SHIPS, min(int(tgt.ships) + 1, ATTACK_MAX_SHIPS))
+                aim = aim_at_target(src, tgt, base_send, world.initial_by_id,
+                                    world.ang_vel, world=world, check_approach=True)
+                if aim is None:
+                    continue
+                _a0, turns0 = aim
+                if tgt.owner != -1:
+                    send = max(base_send, effective_needed_to_capture(tgt, turns0, world)
+                               + _reaction_margin(turns0))
+                else:
+                    send = base_send
+                if spare_of(src, keep) < send:
+                    continue
+                if not _roi_ok(world, tgt, 1):
+                    continue
+                re_aim = aim_at_target(src, tgt, send, world.initial_by_id,
+                                       world.ang_vel, world=world, check_approach=True)
+                if re_aim is None:
+                    continue
+                angle, turns = re_aim
+                cands.append({"kind": "attack", "src": src, "tgt": tgt, "send": int(send),
+                              "angle": angle, "turns": turns, "keep": keep,
+                              "heur": _score_target(src, tgt, world),
+                              "action": {"target_id": int(tgt.id),
+                                         "arrival_turn": int(turns), "ships": int(send)}})
+        # ---- DEFENSE candidates: own planets the do-nothing projection loses ----
+        for victim in world.my_planets:
+            if mode_log.get(victim.id):
+                continue
+            owner_at, ships_at = predict_defender_at_arrival(world, victim, FWD_SIM_HORIZON)
+            if owner_at == world.player:
+                continue  # holds on its own
+            reinforce = int(math.ceil(ships_at)) + 1
+            for src in sorted(world.my_planets, key=lambda s: dist(s.x, s.y, victim.x, victim.y)):
+                if src.id == victim.id or mode_log.get(src.id):
+                    continue
+                keep = _safe_reserve(world, src)
+                send = max(MIN_DISPATCH_SHIPS, reinforce)
+                if spare_of(src, keep) < send:
+                    continue
+                aim = aim_at_target(src, victim, send, world.initial_by_id,
+                                    world.ang_vel, world=world)
+                if aim is None:
+                    continue
+                angle, turns = aim
+                if turns > SEGMENT_MAX_TURNS:
+                    continue
+                cands.append({"kind": "defense", "src": src, "tgt": victim, "send": int(send),
+                              "angle": angle, "turns": turns, "keep": keep,
+                              "heur": float(victim.production) * 5.0,
+                              "action": {"target_id": int(victim.id),
+                                         "arrival_turn": int(turns), "ships": int(send)}})
+                break  # one reinforcer per victim
+
+        if not cands:
+            return
+        # forward-sim score the most promising candidates (budget-capped)
+        cands.sort(key=lambda c: -c["heur"])
+        budget = 40
+        scored = []
+        for c in cands:
+            if budget <= 0:
+                break
+            gain = o_melis_evaluate(world, our_step_action=c["action"]) - baseline
+            budget -= 1
+            if gain > gain_floor:
+                c["gain"] = gain
+                scored.append(c)
+        scored.sort(key=lambda c: -c["gain"])
+    except Exception:
+        # anything unexpected -> nothing committed yet, fall back to per-source
+        handle_steady_fire(world, available, spent, target_locked, moves, mode_log)
+        return
+
+    # ---- greedy commit: best board gain first, one per target, budget aware ----
+    for c in scored:
+        src, tgt = c["src"], c["tgt"]
+        if mode_log.get(src.id) or tgt.id in target_locked:
+            continue
+        if spare_of(src, c["keep"]) < c["send"]:
+            continue
+        if c["kind"] == "attack":
+            dest, dest_aim = _resolve_relay(world, src, tgt, c["send"])
+            if dest is None:
+                continue
+            d_angle, d_turns = dest_aim
+            _commit_fleet(world, moves, spent, target_locked,
+                          src.id, dest.id, d_angle, d_turns, c["send"])
+            mode_log[src.id] = "unified-attack"
+        else:
+            _commit_fleet(world, moves, spent, target_locked,
+                          src.id, tgt.id, c["angle"], c["turns"], c["send"])
+            mode_log[src.id] = "unified-defense"
+            mode_log[tgt.id] = "unified-defended"
+
+
 def _get_quadrant_from_pos(x, y):
     """Return quadrant 0-3 for a given (x,y) position."""
     x_half = 1 if x >= CENTER_X else 0
@@ -5100,7 +5242,7 @@ def plan_moves(world, deadline=None):
     # forward-sim and (for enemies) sends enough to capture. Frontier planets are
     # rich (fed by concentration), so this becomes the decisive concentrated blow.
     if not _over_budget():
-        handle_steady_fire(world, available, spent, target_locked, moves, mode_log)
+        handle_unified_strike(world, available, spent, target_locked, moves, mode_log)
 
     # Economy: grab worthwhile comets for their temporary production (evac pulls
     # the ships back before the comet leaves).
