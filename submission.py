@@ -118,7 +118,7 @@ AIM_MAX_ITERS = 8
 AIM_CONVERGE_DIST = 0.5
 AIM_CONVERGE_TURNS = 1
 
-ATTACK_MAX_SHIPS = 20          # non-collector attack cap
+ATTACK_MAX_SHIPS = 50          # mid-late attack cap: send bigger, faster fleets (was 20)
 
 COMET_EVAC_REMAINING_TURNS = 8
 COMET_EVAC_MIN_SHIPS = MIN_DISPATCH_SHIPS
@@ -4286,10 +4286,6 @@ def handle_frontier_concentration(world, available, spent, target_locked, moves,
             continue
         if _get_quadrant(src) == target_q:
             continue  # target-quadrant planets keep ships for attack/defense
-        # Only interior (anchored-quadrant) surplus flows forward; planets that
-        # drifted outside our territory are handled by the reclaim pass.
-        if _parent_quads and _get_quadrant(src) not in _parent_quads:
-            continue
         keep = _safe_reserve(world, src)
         surplus = (available[src.id] - spent[src.id]) - keep
         if surplus < MIN_DISPATCH_SHIPS:
@@ -5252,14 +5248,11 @@ def plan_moves(world, deadline=None):
     if not _over_budget():
         handle_comet_capture(world, available, spent, target_locked, moves, mode_log)
 
-    # Reclaim: pull ships from planets that drifted outside our anchored
-    # territory back to the nearest anchor (keeps our force coherent). Runs
-    # before frontier concentration so drifted planets go home, not forward.
-    if not _over_budget():
-        handle_reclaim_drift(world, available, spent, target_locked, moves, mode_log)
+    # (Parent-gather/reclaim disabled: we keep the territory concept but no longer
+    # pull drifted ships back to the anchor -- all surplus flows forward instead.)
 
-    # Frontier concentration: drain INTERIOR (anchored-quadrant) surplus toward
-    # the frontier / most-pressured direction. (Drifted planets are reclaimed.)
+    # Frontier concentration: drain surplus toward the frontier / most-pressured
+    # direction (all planets, drifted included).
     if not _over_budget():
         handle_frontier_concentration(world, available, spent, target_locked, moves, mode_log)
 
