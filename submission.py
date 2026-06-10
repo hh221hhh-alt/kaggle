@@ -118,7 +118,7 @@ AIM_MAX_ITERS = 8
 AIM_CONVERGE_DIST = 0.5
 AIM_CONVERGE_TURNS = 1
 
-ATTACK_MAX_SHIPS = 50          # mid-late attack cap: send bigger, faster fleets (was 20)
+ATTACK_MAX_SHIPS = 50          # used only for target value/cost scoring scale now
 
 COMET_EVAC_REMAINING_TURNS = 8
 COMET_EVAC_MIN_SHIPS = MIN_DISPATCH_SHIPS
@@ -4411,7 +4411,6 @@ def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
              if p.owner != world.player
              and p.id not in target_locked
              and is_targetable(world, p)
-             and (is_early or int(p.ships) < ATTACK_MAX_SHIPS)
              and (is_early or home_clear
                   or (hx is not None and dist(p.x, p.y, hx, hy) <= dist_limit))],
             key=lambda p: -_score_target(src, p, world)
@@ -4432,7 +4431,7 @@ def handle_steady_fire(world, available, spent, target_locked, moves, mode_log):
                 send = max(min_send, int(tgt.ships) + 1)
             else:
                 min_send = MIN_DISPATCH_SHIPS
-                send = max(min_send, min(int(tgt.ships) + 1, ATTACK_MAX_SHIPS))
+                send = max(min_send, int(tgt.ships) + 1)  # full need, no cap (#3)
             avail = available[src.id] - spent[src.id]
             if avail < send + keep:
                 if is_early:
