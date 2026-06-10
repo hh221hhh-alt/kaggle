@@ -186,6 +186,13 @@ OPP_W_COST = 0.1
 OPP_W_DIST = 0.05
 OPP_MAX_COALITION = 3            # max planets that may combine on one opportunistic target
 ASSAULT_MAX_COALITION = 4        # max planets that may combine to crack one assault target
+# Opponent adaptation (#5) + proactive defense (#4). Aggression = share of the
+# enemy's force that is in flight (vs sitting on planets), smoothed over turns.
+AGGRESSION_EMA = 0.3             # smoothing factor for the aggression estimate
+AGGRESSION_THRESHOLD = 0.25      # >= this share mobilized -> "aggressive" -> pre-defend
+PROACTIVE_PRESSURE_MIN = 8.0     # only pre-reinforce planets whose net pressure clears this
+PROACTIVE_MAX_TARGETS = 2        # at most this many pre-reinforcements per turn
+PROACTIVE_MAX_SEND = 30          # cap ships sent per pre-reinforcement
 # Parent (territory anchor) system. Parents = anchored quadrants; the anchor
 # planet of a quadrant is its most central (corner-ward), static-preferred owned
 # planet. Ships from planets that drift OUT of our anchored quadrants are pulled
@@ -1877,6 +1884,7 @@ _parent_quads = set()       # anchored quadrants (our territory); grows up to PA
 _drift_start = {}           # planet id -> step it drifted out of our territory
 _drift_count = {}           # planet id -> reclaims done since it drifted
 _late_latched = False       # True once the board is >= BOARD_FILL_SWITCH claimed (leave early phase)
+_opp_aggression = 0.0       # smoothed estimate of how aggressive the opponent is (0-1)
 _starting_max_prod = None   # max production of starting planets (set at step 0)
 _idle_streak = {}           # planet_id -> consecutive turns with no target
 _2p_patient_streak = 0
@@ -4590,6 +4598,66 @@ def _update_parent_quads(world):
             _parent_quads.add(q)
 
 
+def _opponent_aggression(world):
+    """Smoothed estimate (0-1) of how aggressive the opponent is = the share of
+    enemy force that is IN FLIGHT (vs sitting on planets). Updated once per turn;
+    high = they are attacking, low = they are hoarding. Works in 2P and 4P."""
+    global _opp_aggression
+    in_flight = sum(int(f.ships) for f in world.fleets
+                    if f.owner != world.player and f.owner != -1 and int(f.ships) > 0)
+    on_planet = sum(int(p.ships) for p in world.enemy_planets)
+    total = in_flight + on_planet
+    inst = (in_flight / total) if total > 0 else 0.0
+    _opp_aggression = AGGRESSION_EMA * inst + (1.0 - AGGRESSION_EMA) * _opp_aggression
+    return _opp_aggression
+
+
+def handle_proactive_defense(world, available, spent, target_locked, moves, mode_log):
+    """One move ahead of the reactive defense: when the opponent is AGGRESSIVE,
+    pre-thicken the planets most worth protecting before the enemy even launches.
+    Candidates are owned planets whose net pressure (in-flight + reachable enemy
+    mass - own defense) clears PROACTIVE_PRESSURE_MIN; among those we defend the
+    most VALUABLE (highest production) first, up to PROACTIVE_MAX_TARGETS, pulling
+    a capped top-up from the nearest safe (low-pressure) planet. Skipped entirely
+    against a passive opponent (focus offense instead)."""
+    if not world.enemy_planets:
+        return
+    if _opponent_aggression(world) < AGGRESSION_THRESHOLD:
+        return  # passive opponent -> don't tie up ships pre-defending
+    pres = {p.id: _planet_pressure(world, p) for p in world.my_planets}
+    victims = [p for p in world.my_planets
+               if pres[p.id] >= PROACTIVE_PRESSURE_MIN and not mode_log.get(p.id)]
+    if not victims:
+        return
+    # value first (production), then how badly pressured
+    victims.sort(key=lambda p: (-float(p.production), -pres[p.id]))
+    for victim in victims[:PROACTIVE_MAX_TARGETS]:
+        need = min(int(math.ceil(pres[victim.id])), PROACTIVE_MAX_SEND)
+        if need < MIN_DISPATCH_SHIPS:
+            continue
+        for src in sorted(world.my_planets, key=lambda s: dist(s.x, s.y, victim.x, victim.y)):
+            if src.id == victim.id or mode_log.get(src.id):
+                continue
+            if pres.get(src.id, 0.0) >= PROACTIVE_PRESSURE_MIN:
+                continue  # don't strip another threatened planet
+            keep = _safe_reserve(world, src)
+            spare = (available[src.id] - spent[src.id]) - keep
+            if spare < MIN_DISPATCH_SHIPS:
+                continue
+            send = min(spare, need)
+            aim = aim_at_target(src, victim, send, world.initial_by_id, world.ang_vel, world=world)
+            if aim is None:
+                continue
+            angle, turns = aim
+            if turns > SEGMENT_MAX_TURNS:
+                continue  # too far to help in time
+            _commit_fleet(world, moves, spent, target_locked,
+                          src.id, victim.id, angle, turns, int(send))
+            mode_log[src.id] = "proactive-defense"
+            mode_log[victim.id] = "proactive-defended"
+            break
+
+
 def handle_reclaim_drift(world, available, spent, target_locked, moves, mode_log):
     """Pull ships from planets that have drifted OUT of our anchored quadrants
     back to the nearest anchor, keeping our force coherent. A drifted planet
@@ -5014,6 +5082,11 @@ def plan_moves(world, deadline=None):
     handle_defense(world, rescue_needs, available, spent, target_locked, moves, mode_log)
     if not _over_budget():
         handle_home_defense(world, available, spent, target_locked, moves, mode_log)
+
+    # Proactive defense: vs an AGGRESSIVE opponent, pre-thicken the most valuable
+    # threatened planets before they're hit. Skipped vs a passive opponent.
+    if not _over_budget():
+        handle_proactive_defense(world, available, spent, target_locked, moves, mode_log)
 
     # Tempo strikes BEFORE the general capture pass, so they claim weakened /
     # finishable enemies first: hit planets that just launched (thin), then go
@@ -8846,10 +8919,11 @@ def agent(obs, config=None):
     global _agent_step, _pending_commitments
     global _game_num_players, _2p_patient_streak, _2p_prod_share_history
 
-    global _opp_profile, _starting_max_prod, _home_quadrant, _parent_ids, _late_latched
+    global _opp_profile, _starting_max_prod, _home_quadrant, _parent_ids, _late_latched, _opp_aggression
     obs_step = _read(obs, "step", 0) or 0
     if obs_step == 0:
         _late_latched = False
+        _opp_aggression = 0.0
         _agent_step = 0
         _pending_commitments = []
         _game_num_players = None
