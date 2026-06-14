@@ -1,0 +1,18 @@
+# caches / build / app state
+__pycache__/
+*.pyc
+.claude/
+build/
+# large data (regeneratable) — keep code, not gigabytes
+replays/
+kernels/
+*.pt
+*.zip
+*.tar.gz
+orbit-wars*.csv
+my_games.json
+jake_eps.json
+top_subs.json
+# secrets
+*.kaggle
+access_token
