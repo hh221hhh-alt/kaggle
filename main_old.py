@@ -1,4 +1,3 @@
-%%writefile submission.py
 import math
 import os
 import time
@@ -9183,3 +9182,8 @@ def agent(obs, config=None):
 
 
 __all__ = ["agent", "Planet", "Fleet"]
+
+
+# ---- OLD-BOT-ONLY override (for A/B testing): always use the embedded old bot ----
+def agent(obs, config=None):
+    return o_agent(obs, config)

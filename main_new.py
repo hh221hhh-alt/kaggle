@@ -1,4 +1,3 @@
-%%writefile submission.py
 import math
 import os
 import time
